@@ -1978,6 +1978,7 @@ async fn legacy_partial_ciphertext_order(
     legacy_format: bool,
     carrier: bool,
     restart_ambiguous: bool,
+    recover_store_failure: bool,
 ) {
     let mut f = Fixture::new("PARTIAL_CIPHERTEXT_ORDER", false).await;
     let group: Jid = "120363000000000032@g.us".parse().unwrap();
@@ -2064,7 +2065,39 @@ async fn legacy_partial_ciphertext_order(
     f.stanza = original;
     f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
     f.hook.fail.store(false, Ordering::SeqCst);
+    if recover_store_failure {
+        f.buffer_failure(true);
+    }
     f.receive().await;
+    if recover_store_failure {
+        assert_eq!(f.pending().await.unwrap(), legacy);
+        assert!(f.published().is_empty());
+        assert_eq!(f.receipts(), 0);
+        assert!(
+            f.client
+                .inbound_commit_batch
+                .retention
+                .awaiting_order(&f.info)
+        );
+        f.buffer_failure(false);
+        // No new delivery is supplied. The worker must recover the deferred
+        // write after the backend becomes available, before requesting order.
+        tokio::time::timeout(std::time::Duration::from_secs(7), async {
+            loop {
+                if durability::deferred_parts(&f.pending().await.unwrap())
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(f.published().is_empty());
+        assert_eq!(f.receipts(), 0);
+    }
     if legacy_format {
         assert!(
             f.published().is_empty(),
@@ -2193,11 +2226,11 @@ async fn legacy_partial_ciphertext_order(
 
 #[tokio::test]
 async fn legacy_partial_retry_preserves_middle_occurrence() {
-    legacy_partial_ciphertext_order(false, true, false, false).await;
+    legacy_partial_ciphertext_order(false, true, false, false, false).await;
 }
 #[tokio::test]
 async fn legacy_partial_retry_preserves_leading_repeat() {
-    legacy_partial_ciphertext_order(true, true, false, false).await;
+    legacy_partial_ciphertext_order(true, true, false, false, false).await;
 }
 
 #[tokio::test]
@@ -2260,12 +2293,12 @@ async fn mixed_bot_and_signal_parts_keep_wire_order() {
 
 #[tokio::test]
 async fn sourced_partial_retry_preserves_leading_repeat() {
-    legacy_partial_ciphertext_order(true, false, false, false).await;
+    legacy_partial_ciphertext_order(true, false, false, false, false).await;
 }
 
 #[tokio::test]
 async fn legacy_partial_retry_accepts_complete_resend_with_skdm_carrier() {
-    legacy_partial_ciphertext_order(false, true, true, false).await;
+    legacy_partial_ciphertext_order(false, true, true, false, false).await;
 }
 #[tokio::test]
 async fn compatible_alias_rows_combine_ciphertext_histories() {
@@ -2431,5 +2464,10 @@ async fn identical_bot_ciphertexts_keep_repeated_occurrences_after_retry() {
 
 #[tokio::test]
 async fn ambiguous_legacy_partial_survives_signal_flush_and_restart() {
-    legacy_partial_ciphertext_order(false, true, false, true).await;
+    legacy_partial_ciphertext_order(false, true, false, true, false).await;
+}
+
+#[tokio::test]
+async fn ambiguous_pending_store_failure_recovers_without_another_delivery() {
+    legacy_partial_ciphertext_order(false, true, false, false, true).await;
 }

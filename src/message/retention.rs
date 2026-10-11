@@ -1293,6 +1293,38 @@ impl Client {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn canceled_partial_collection_keeps_fresh_for_order_recovery() {
+        let retention = Arc::new(InboundRetention::default());
+        let first = item("canceled-order", "A");
+        retention.begin(&first.info, None).await;
+        retention.stage(std::slice::from_ref(&first), false);
+        retention.seal(&first.info, false);
+        retention.begin(&first.info, None).await;
+        let collection = retention.collection_guard(&first.info);
+        {
+            let mut stanzas = lock(&retention.stanzas);
+            let stanza = stanzas.get_mut(&key(&first.info)).unwrap();
+            stanza.delivery = vec![(0, [1; 32]), (1, [2; 32])];
+            stanza.current_source = Some([2; 32]);
+        }
+        retention.stage(&[item("canceled-order", "B")], false);
+        drop(collection);
+        assert!(retention.awaiting_order(&first.info));
+        let snapshot = retention.pending_order_snapshot(&first.info).unwrap();
+        assert_eq!(snapshot.groups.len(), 2);
+        assert_eq!(
+            snapshot.groups[0][0].0.message.conversation.as_deref(),
+            Some("A")
+        );
+        assert_eq!(
+            snapshot.groups[1][0].0.message.conversation.as_deref(),
+            Some("B")
+        );
+        assert!(retention.commit(std::slice::from_ref(&first)).is_none());
+        assert_eq!(retention.order_retries().len(), 1);
+    }
+
+    #[tokio::test]
     async fn awaiting_order_worker_waits_for_connection_then_requests_recovery() {
         let client = crate::test_utils::create_test_client_with_failing_http("order_worker").await;
         let first = item("order-worker", "A");
