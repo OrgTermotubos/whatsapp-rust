@@ -29,9 +29,15 @@ use waproto::whatsapp as wa;
 /// that sequence and its repeated parts. Corrupt or conflicting matching rows
 /// fail closed. Partial retries whose ciphertexts cannot prove the retained
 /// occurrence order withhold commit until a complete sequence proves it.
-/// Fresh parts waiting for that proof remain in this Client; after a restart,
-/// another fully decoded delivery may be needed. Receipt suppression does not
-/// guarantee that the server provides one.
+/// Fresh parts waiting for that proof remain in this Client and are stored as
+/// separate deferred sequences before that receive path flushes Signal. Replay
+/// restores their blocked state and requires a candidate to cover every waiting
+/// sequence, including unknown fields and repeated occurrences. A pending-write
+/// failure returns before that path's Signal flush; independent cache flushes
+/// are not part of a shared transaction. Connected recovery retries use the
+/// existing retry cap and preserve the stanza's hide/show mode. A restart before
+/// the pending write can still require another fully decoded delivery. Receipt
+/// suppression does not guarantee that the server provides one.
 /// Only rows read for the
 /// successful commit (and rows it wrote) are removed; unrelated participants,
 /// chats, message ids and backend devices are preserved.
