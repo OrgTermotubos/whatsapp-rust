@@ -634,6 +634,9 @@ impl Client {
         }
 
         if self.inbound_durability_hook().is_some() {
+            self.inbound_commit_batch
+                .retention
+                .set_order_retry_mode(&info, decrypt_fail_mode);
             self.inbound_commit_batch.retention.set_delivery(
                 &info,
                 session_payloads

@@ -378,7 +378,7 @@ impl Client {
     /// Increment the retry count and send the retry receipt (or, at the cap, a
     /// last-resort PDO). This is the shared operation used by explicit requests
     /// and the automatic decrypt-failure pipeline.
-    async fn request_retry_for_info(
+    pub(super) async fn request_retry_for_info(
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
         options: crate::features::RetryRequestOptions,

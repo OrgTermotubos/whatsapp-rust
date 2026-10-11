@@ -88,6 +88,8 @@ struct Stanza {
     delivery: Vec<(usize, PayloadSource)>,
     current_source: Option<PayloadSource>,
     ordering_blocked: bool,
+    order_retry_owner: Option<u64>,
+    retry_mode: crate::types::events::DecryptFailMode,
     state: State,
     receipt: bool,
     ticket: Option<InboundCommitTicket>,
@@ -479,6 +481,7 @@ impl InboundRetention {
             // prior parts while a re-encrypted resend is examined for new parts.
             stanza.id = id;
             stanza.state = State::Collecting;
+            stanza.order_retry_owner = None;
             if stanza.fresh.len() > stanza.fresh_boundaries.last().copied().unwrap_or_default() {
                 stanza.fresh_boundaries.push(stanza.fresh.len());
             }
@@ -500,6 +503,8 @@ impl InboundRetention {
                 delivery: Vec::new(),
                 current_source: None,
                 ordering_blocked: false,
+                order_retry_owner: None,
+                retry_mode: crate::types::events::DecryptFailMode::Show,
                 state: State::Collecting,
                 receipt: false,
                 ticket: None,
@@ -854,6 +859,35 @@ impl InboundRetention {
         stanza.state = State::Scheduled;
         Some(RetryAttempt::new(self, key, stanza))
     }
+    pub(super) fn set_order_retry_mode(
+        &self,
+        info: &MessageInfo,
+        mode: crate::types::events::DecryptFailMode,
+    ) {
+        if let Some(stanza) = lock(&self.stanzas).get_mut(&key(info)) {
+            stanza.retry_mode = mode;
+        }
+    }
+    fn order_retries(self: &Arc<Self>) -> Vec<OrderRetryAttempt> {
+        lock(&self.stanzas)
+            .iter_mut()
+            .filter_map(|(key, stanza)| {
+                if stanza.state != State::AwaitingOrder || stanza.order_retry_owner.is_some() {
+                    return None;
+                }
+                let first = stanza.items.first().or_else(|| stanza.fresh.first())?;
+                let info = Arc::clone(&first.info);
+                stanza.order_retry_owner = Some(stanza.id);
+                Some(OrderRetryAttempt {
+                    retention: Arc::clone(self),
+                    key: key.clone(),
+                    id: stanza.id,
+                    info,
+                    mode: stanza.retry_mode,
+                })
+            })
+            .collect()
+    }
     fn retry_items(self: &Arc<Self>) -> Vec<RetryAttempt> {
         let mut stanzas = lock(&self.stanzas);
         stanzas
@@ -891,6 +925,36 @@ impl Drop for RetentionCollection {
             } else {
                 stanza.state = State::Retry;
             }
+        }
+    }
+}
+
+// Scheduling owns only the request, not permission to commit uncertain parts.
+struct OrderRetryAttempt {
+    retention: Arc<InboundRetention>,
+    key: Key,
+    id: u64,
+    info: Arc<MessageInfo>,
+    mode: crate::types::events::DecryptFailMode,
+}
+impl OrderRetryAttempt {
+    fn is_current(&self) -> bool {
+        lock(&self.retention.stanzas)
+            .get(&self.key)
+            .is_some_and(|stanza| {
+                stanza.id == self.id
+                    && stanza.state == State::AwaitingOrder
+                    && stanza.order_retry_owner == Some(self.id)
+            })
+    }
+}
+impl Drop for OrderRetryAttempt {
+    fn drop(&mut self) {
+        if let Some(stanza) = lock(&self.retention.stanzas).get_mut(&self.key)
+            && stanza.id == self.id
+            && stanza.order_retry_owner == Some(self.id)
+        {
+            stanza.order_retry_owner = None;
         }
     }
 }
@@ -1133,6 +1197,67 @@ impl Client {
                             }))
                             .detach();
                     }
+                    // Offline ticks must not consume the protocol retry cap.
+                    if client.is_socket_connected() {
+                        for attempt in retention.order_retries() {
+                            let client = Arc::clone(&client);
+                            client
+                                .clone()
+                                .runtime
+                                .spawn(Box::pin(async move {
+                                    let _chat = client
+                                        .inbound_commit_batch
+                                        .retention
+                                        .chat_gate(&attempt.info)
+                                        .lock_arc()
+                                        .await;
+                                    let _permit = client.acquire_message_processing_permit().await;
+                                    if !attempt.is_current() || !client.is_socket_connected() {
+                                        return;
+                                    }
+                                    if let Err(error) =
+                                        client.persist_awaiting_inbound_order(&attempt.info).await
+                                    {
+                                        log::warn!(
+                                            "Cannot persist waiting retry plaintext: {error:?}"
+                                        );
+                                        return;
+                                    }
+                                    let cache_key = client
+                                        .make_retry_cache_key(
+                                            &attempt.info.source.chat,
+                                            &attempt.info.id,
+                                            &attempt.info.source.sender,
+                                        )
+                                        .await;
+                                    // The foreground already owns cap fallback.
+                                    // A worker tick must not repeat PDO indefinitely.
+                                    if client
+                                        .message_retry_counts
+                                        .get(&cache_key)
+                                        .await
+                                        .is_some_and(|(count, _)| count >= MAX_DECRYPT_RETRIES)
+                                    {
+                                        return;
+                                    }
+                                    if let Err(error) = client
+                                        .request_retry_for_info(
+                                            &attempt.info,
+                                            crate::features::RetryRequestOptions::new()
+                                                .with_reason(RetryReason::InvalidMessage)
+                                                .with_decrypt_fail_mode(attempt.mode),
+                                            None,
+                                        )
+                                        .await
+                                    {
+                                        log::warn!(
+                                            "Cannot request retained order recovery: {error:?}"
+                                        );
+                                    }
+                                }))
+                                .detach();
+                        }
+                    }
                     for attempt in retention.retry_items() {
                         let client = Arc::clone(&client);
                         client
@@ -1167,6 +1292,79 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn awaiting_order_worker_waits_for_connection_then_requests_recovery() {
+        let client = crate::test_utils::create_test_client_with_failing_http("order_worker").await;
+        let first = item("order-worker", "A");
+        let retention = &client.inbound_commit_batch.retention;
+        retention.begin(&first.info, None).await;
+        retention.stage(std::slice::from_ref(&first), false);
+        {
+            let mut stanzas = lock(&retention.stanzas);
+            let stanza = stanzas.get_mut(&key(&first.info)).unwrap();
+            stanza.state = State::AwaitingOrder;
+            stanza.ordering_blocked = true;
+        }
+        let cache_key = client
+            .make_retry_cache_key(
+                &first.info.source.chat,
+                &first.info.id,
+                &first.info.source.sender,
+            )
+            .await;
+        client.set_connected_for_test(false);
+        client.start_inbound_recovery();
+        tokio::time::sleep(RETRY_INTERVAL + std::time::Duration::from_millis(100)).await;
+        assert!(client.message_retry_counts.get(&cache_key).await.is_none());
+        client.set_connected_for_test(true);
+        // No socket is installed: request construction must still occur, and
+        // its transport failure must leave the uncertain parts uncommitted.
+        tokio::time::timeout(RETRY_INTERVAL + std::time::Duration::from_secs(2), async {
+            while client.message_retry_counts.get(&cache_key).await.is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(retention.awaiting_order(&first.info));
+        assert!(retention.commit(std::slice::from_ref(&first)).is_none());
+        client.set_connected_for_test(false);
+    }
+
+    #[tokio::test]
+    async fn awaiting_order_request_ownership_survives_cancel_and_successor() {
+        let retention = Arc::new(InboundRetention::default());
+        let first = item("awaiting-retry", "A");
+        retention.begin(&first.info, None).await;
+        retention.stage(std::slice::from_ref(&first), false);
+        {
+            let mut stanzas = lock(&retention.stanzas);
+            let stanza = stanzas.get_mut(&key(&first.info)).unwrap();
+            stanza.state = State::AwaitingOrder;
+            stanza.ordering_blocked = true;
+        }
+        retention.set_order_retry_mode(&first.info, crate::types::events::DecryptFailMode::Hide);
+        let old = retention.order_retries().pop().unwrap();
+        assert_eq!(old.mode, crate::types::events::DecryptFailMode::Hide);
+        assert!(old.is_current());
+        assert!(retention.order_retries().is_empty());
+        assert!(retention.commit(std::slice::from_ref(&first)).is_none());
+        retention.begin(&first.info, None).await;
+        lock(&retention.stanzas)
+            .get_mut(&key(&first.info))
+            .unwrap()
+            .state = State::AwaitingOrder;
+        let successor = retention.order_retries().pop().unwrap();
+        assert!(!old.is_current());
+        drop(old);
+        assert!(successor.is_current());
+        assert!(retention.order_retries().is_empty());
+        drop(successor);
+        let retry = retention.order_retries().pop().unwrap();
+        assert!(retry.is_current());
+        assert!(retention.commit(std::slice::from_ref(&first)).is_none());
+    }
+
     #[tokio::test]
     async fn complete_disjoint_repeated_ciphertexts_append_each_occurrence() {
         let retention = Arc::new(InboundRetention::default());

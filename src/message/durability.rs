@@ -317,6 +317,35 @@ fn is_subsequence(sequence: &[DispatchFingerprint], candidate: &[DispatchFingerp
     remaining.is_empty()
 }
 
+// Earliest and latest embeddings agree exactly when every occurrence's
+// position is unambiguous. Equal payloads alone never select an occurrence.
+fn unique_subsequence_positions(
+    sequence: &[DispatchFingerprint],
+    candidate: &[DispatchFingerprint],
+) -> Option<Vec<usize>> {
+    let mut positions = Vec::with_capacity(sequence.len());
+    let mut next = 0;
+    for fingerprint in sequence {
+        let offset = candidate[next..]
+            .iter()
+            .position(|part| part == fingerprint)?;
+        next += offset;
+        positions.push(next);
+        next += 1;
+    }
+    let mut end = candidate.len();
+    for (fingerprint, earliest) in sequence.iter().zip(&positions).rev() {
+        let latest = candidate[..end]
+            .iter()
+            .rposition(|part| part == fingerprint)?;
+        if latest != *earliest {
+            return None;
+        }
+        end = latest;
+    }
+    Some(positions)
+}
+
 pub(super) struct PendingReplay {
     pub(super) items: Vec<InboundMessage>,
     pub(super) waiting: Vec<Vec<InboundMessage>>,
@@ -440,13 +469,19 @@ impl Client {
                 )
             })
         {
-            // Equally complete aliases may carry identities from different
-            // encrypted retries. Their occurrence sequences align exactly.
+            // Partial aliases can also prove ciphertext identities, provided
+            // there is exactly one placement for every occurrence.
             for index in 0..candidates.len() {
-                if index == complete || sequences[index] != sequences[complete] {
+                if index == complete {
                     continue;
                 }
-                for (old, selected) in candidates[index].iter().zip(&candidates[complete]) {
+                let Some(positions) =
+                    unique_subsequence_positions(&sequences[index], &sequences[complete])
+                else {
+                    continue;
+                };
+                for (old, position) in candidates[index].iter().zip(positions) {
+                    let selected = &candidates[complete][position];
                     if let Some(incoming) = replay
                         .sources
                         .get(&(Arc::as_ptr(&old.message) as usize))
@@ -846,6 +881,55 @@ mod tests {
         let duplicate = encode_pending_parts(&[&original, &original]);
         assert!(extend_pending_record(&duplicate, &proposed).is_err());
         assert!(extend_pending_record(&original, &first).is_err());
+    }
+
+    async fn partial_alias_sources(repeated: bool) {
+        let client = create_test_client_with_failing_http("partial_alias_sources").await;
+        let mut info = (*test_info("PARTIAL_ALIAS_SOURCES")).clone();
+        info.source.is_group = true;
+        let info = Arc::new(info);
+        let a = [10, 1, b'a', 0xc0, 0x3e, 7];
+        let b = [10, 1, b'b'];
+        let canonical = if repeated {
+            encode_pending_parts(&[&a, &a, &b])
+        } else {
+            encode_pending_parts(&[&a, &b])
+        };
+        let partial = encode_pending_sourced_parts(&[(&a, Some([9; 32]))]);
+        let backend = client.persistence_manager.backend();
+        for (sender, bytes) in [
+            ("200@s.whatsapp.net", canonical.as_slice()),
+            ("200:1@s.whatsapp.net", partial.as_slice()),
+        ] {
+            backend
+                .store_pending_inbound("100@g.us", sender, &info.id, bytes)
+                .await
+                .unwrap();
+        }
+        let replay = client.load_pending_inbound(&info).await.unwrap();
+        assert_eq!(replay.items.len(), if repeated { 3 } else { 2 });
+        let first = &replay.items[0];
+        let sources = replay.sources.get(&(Arc::as_ptr(&first.message) as usize));
+        if repeated {
+            assert!(
+                sources.is_none(),
+                "a partial A cannot choose either retained A"
+            );
+        } else {
+            assert_eq!(sources.unwrap().as_slice(), &[[9; 32]]);
+        }
+        let mut encoded = Vec::new();
+        waproto::codec::message_encode_into(&first.message, &mut encoded);
+        assert_eq!(encoded, a);
+        assert_eq!(replay.keys.len(), 2);
+    }
+    #[tokio::test]
+    async fn compatible_partial_alias_preserves_unique_ciphertext_provenance() {
+        partial_alias_sources(false).await;
+    }
+    #[tokio::test]
+    async fn repeated_partial_alias_does_not_guess_ciphertext_provenance() {
+        partial_alias_sources(true).await;
     }
 
     #[tokio::test]
