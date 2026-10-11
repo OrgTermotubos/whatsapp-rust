@@ -15,6 +15,7 @@ use wacore::types::events::InboundMessage;
 const PARTS_HEADER: &[u8] = b"\0WAPI\x01";
 const SOURCED_PARTS_HEADER: &[u8] = b"\0WAPI\x02";
 const SOURCE_SETS_HEADER: &[u8] = b"\0WAPI\x03";
+const DEFERRED_PARTS_HEADER: &[u8] = b"\0WAPI\x04";
 
 #[derive(Clone)]
 struct PendingPart<'a> {
@@ -69,7 +70,7 @@ pub(super) fn encode_pending_parts(parts: &[&[u8]]) -> Vec<u8> {
     record
 }
 
-fn pending_records(bytes: &[u8]) -> anyhow::Result<Vec<PendingPart<'_>>> {
+fn plain_pending_records(bytes: &[u8]) -> anyhow::Result<Vec<PendingPart<'_>>> {
     if bytes.first() != Some(&0) {
         return Ok(vec![PendingPart {
             bytes,
@@ -134,6 +135,91 @@ fn pending_records(bytes: &[u8]) -> anyhow::Result<Vec<PendingPart<'_>>> {
     anyhow::ensure!(!parts.is_empty(), "empty pending-inbound record");
     Ok(parts)
 }
+pub(super) struct DeferredParts<'a> {
+    pub(super) canonical: &'a [u8],
+    pub(super) waiting: Vec<&'a [u8]>,
+}
+
+pub(super) fn deferred_parts(bytes: &[u8]) -> anyhow::Result<Option<DeferredParts<'_>>> {
+    let Some(mut remaining) = bytes.strip_prefix(DEFERRED_PARTS_HEADER) else {
+        return Ok(None);
+    };
+    let mut records = Vec::new();
+    while !remaining.is_empty() {
+        anyhow::ensure!(remaining.len() >= 8, "truncated deferred record length");
+        let length = usize::try_from(u64::from_be_bytes(remaining[..8].try_into()?))?;
+        remaining = &remaining[8..];
+        anyhow::ensure!(
+            (length > 0 || records.is_empty()) && length <= remaining.len(),
+            "truncated deferred record"
+        );
+        anyhow::ensure!(
+            records.len() <= retention::MAX_SOURCE_IDENTITIES,
+            "deferred delivery limit exceeded"
+        );
+        let record = &remaining[..length];
+        // Each group is a plain envelope, so nesting cannot amplify allocation.
+        if !record.is_empty() {
+            plain_pending_records(record)?;
+        }
+        records.push(record);
+        remaining = &remaining[length..];
+    }
+    anyhow::ensure!(
+        records.len() >= 2,
+        "deferred record requires canonical and waiting parts"
+    );
+    let canonical = records.remove(0);
+    Ok(Some(DeferredParts {
+        canonical,
+        waiting: records,
+    }))
+}
+
+fn pending_records(bytes: &[u8]) -> anyhow::Result<Vec<PendingPart<'_>>> {
+    match deferred_parts(bytes)? {
+        Some(record) if record.canonical.is_empty() => Ok(Vec::new()),
+        Some(record) => plain_pending_records(record.canonical),
+        None => plain_pending_records(bytes),
+    }
+}
+
+fn encode_deferred_parts(canonical: &[u8], waiting: &[&[u8]]) -> Vec<u8> {
+    let mut record = DEFERRED_PARTS_HEADER.to_vec();
+    for group in std::iter::once(canonical).chain(waiting.iter().copied()) {
+        record.extend_from_slice(&(group.len() as u64).to_be_bytes());
+        record.extend_from_slice(group);
+    }
+    record
+}
+
+fn append_deferred_parts(
+    existing: Option<&[u8]>,
+    canonical: &[u8],
+    groups: &[Vec<u8>],
+) -> anyhow::Result<Vec<u8>> {
+    let prior = existing.map(deferred_parts).transpose()?.flatten();
+    let original = prior.as_ref().map(|record| record.canonical).or(existing);
+    let canonical = if let Some(original) = original.filter(|record| !record.is_empty()) {
+        extend_pending_record(original, canonical)?.unwrap_or_else(|| original.to_vec())
+    } else {
+        canonical.to_vec()
+    };
+    let mut waiting = prior.map_or_else(Vec::new, |record| record.waiting);
+    for group in groups {
+        // A cancelled store may already have written this exact generation.
+        if !waiting.contains(&group.as_slice()) {
+            waiting.push(group);
+        }
+    }
+    anyhow::ensure!(
+        waiting.len() <= retention::MAX_SOURCE_IDENTITIES,
+        "deferred delivery limit exceeded"
+    );
+    anyhow::ensure!(!waiting.is_empty(), "missing waiting delivery");
+    Ok(encode_deferred_parts(&canonical, &waiting))
+}
+
 #[cfg(test)]
 pub(super) fn pending_parts(bytes: &[u8]) -> anyhow::Result<Vec<&[u8]>> {
     Ok(pending_records(bytes)?
@@ -152,6 +238,20 @@ pub(super) fn extend_pending_record(
     existing: &[u8],
     proposed: &[u8],
 ) -> anyhow::Result<Option<Vec<u8>>> {
+    if let Some(deferred) = deferred_parts(existing)? {
+        let mut merged = if deferred.canonical.is_empty() {
+            proposed.to_vec()
+        } else {
+            extend_pending_record(deferred.canonical, proposed)?
+                .unwrap_or_else(|| deferred.canonical.to_vec())
+        };
+        for waiting in deferred.waiting {
+            if let Some(extended) = extend_pending_record(waiting, &merged)? {
+                merged = extended;
+            }
+        }
+        return Ok(Some(merged));
+    }
     let original_parts = pending_records(existing)?;
     let mut scratch = Vec::new();
     // Replay selection already treats SKDM as a carrier, not a new user
@@ -219,6 +319,7 @@ fn is_subsequence(sequence: &[DispatchFingerprint], candidate: &[DispatchFingerp
 
 pub(super) struct PendingReplay {
     pub(super) items: Vec<InboundMessage>,
+    pub(super) waiting: Vec<Vec<InboundMessage>>,
     pub(super) keys: Vec<(String, String, String)>,
     pub(super) sources: std::collections::HashMap<usize, retention::PayloadSources>,
 }
@@ -266,6 +367,7 @@ impl Client {
         rows.sort_by(|a, b| compare_pending_senders(&a.0, &b.0, &sender));
         let mut replay = PendingReplay {
             items: Vec::new(),
+            waiting: Vec::new(),
             keys: Vec::new(),
             sources: std::collections::HashMap::new(),
         };
@@ -273,6 +375,24 @@ impl Client {
         let mut candidates = Vec::new();
         let mut scratch = Vec::new();
         for (stored_sender, bytes) in rows {
+            if let Some(deferred) = deferred_parts(&bytes)? {
+                for group in deferred.waiting {
+                    let mut waiting = Vec::new();
+                    for part in plain_pending_records(group)? {
+                        let item = InboundMessage::builder()
+                            .message(Arc::new(waproto::codec::message_decode(part.bytes)?))
+                            .info(Arc::clone(info))
+                            .build();
+                        if !part.sources.is_empty() {
+                            replay
+                                .sources
+                                .insert(Arc::as_ptr(&item.message) as usize, part.sources);
+                        }
+                        waiting.push(item);
+                    }
+                    replay.waiting.push(waiting);
+                }
+            }
             let mut items = Vec::new();
             for part in pending_records(&bytes)? {
                 let item = InboundMessage::builder()
@@ -360,10 +480,67 @@ impl Client {
         let live: std::collections::HashSet<_> = replay
             .items
             .iter()
+            .chain(replay.waiting.iter().flatten())
             .map(|item| Arc::as_ptr(&item.message) as usize)
             .collect();
         replay.sources.retain(|key, _| live.contains(key));
         Ok(replay)
+    }
+
+    // Persist successful but unpositioned parts before their Signal keys can
+    // reach storage. The consumer cannot replay this envelope without order proof.
+    pub(super) async fn persist_awaiting_inbound_order(
+        &self,
+        info: &Arc<MessageInfo>,
+    ) -> anyhow::Result<()> {
+        let retention = &self.inbound_commit_batch.retention;
+        let Some(snapshot) = retention.pending_order_snapshot(info) else {
+            return Ok(());
+        };
+        let backend = self.persistence_manager.backend();
+        let chat = info.source.chat.to_string();
+        let sender = info.source.sender.to_string();
+        let existing = backend
+            .get_pending_inbound(&chat, &sender, &info.id)
+            .await?;
+        let id = snapshot.id;
+        let fresh_len = snapshot.fresh_len;
+        let (send, receive) = futures::channel::oneshot::channel();
+        self.runtime
+            .spawn_blocking(Box::new(move || {
+                let records: Vec<_> = snapshot
+                    .groups
+                    .into_iter()
+                    .map(|group| {
+                        if group.is_empty() {
+                            return Vec::new();
+                        }
+                        let encoded: Vec<_> = group
+                            .into_iter()
+                            .map(|(item, sources)| {
+                                let mut bytes = Vec::new();
+                                waproto::codec::message_encode_into(&item.message, &mut bytes);
+                                (bytes, sources)
+                            })
+                            .collect();
+                        encode_pending_source_sets(
+                            &encoded
+                                .iter()
+                                .map(|(bytes, sources)| (bytes.as_slice(), sources.clone()))
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect();
+                let result = append_deferred_parts(existing.as_deref(), &records[0], &records[1..]);
+                let _ = send.send(result);
+            }))
+            .await;
+        let record = receive.await??;
+        backend
+            .store_pending_inbound(&chat, &sender, &info.id, &record)
+            .await?;
+        retention.pending_order_persisted(info, id, fresh_len);
+        Ok(())
     }
 
     /// The registered inbound durability hook, if any. `None` (default) keeps
@@ -442,6 +619,67 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deferred_completion_keeps_unknown_chunks_and_rejects_missing_parts() {
+        let a = [10, 1, b'A'];
+        let b = [10, 1, b'B', 192, 62, 7];
+        let c = [10, 1, b'C'];
+        let canonical = encode_pending_parts(&[&a]);
+        let waiting = encode_pending_source_sets(&[(&b, smallvec::smallvec![[3; 32]])]);
+        let deferred =
+            append_deferred_parts(None, &canonical, std::slice::from_ref(&waiting)).unwrap();
+        assert_eq!(
+            deferred_parts(&deferred).unwrap().unwrap().canonical,
+            canonical
+        );
+        assert!(extend_pending_record(&deferred, &encode_pending_parts(&[&a, &c])).is_err());
+        let wrong_future = [10, 1, b'B', 192, 62, 8];
+        assert!(
+            extend_pending_record(&deferred, &encode_pending_parts(&[&a, &wrong_future, &c]))
+                .is_err()
+        );
+        let complete = extend_pending_record(&deferred, &encode_pending_parts(&[&a, &b, &c]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending_parts(&complete).unwrap(), [&a[..], &b[..], &c[..]]);
+        assert!(deferred_parts(&complete).unwrap().is_none());
+        let repeated_store =
+            append_deferred_parts(Some(&deferred), &canonical, &[waiting]).unwrap();
+        assert_eq!(
+            repeated_store, deferred,
+            "cancellation after a successful write must not duplicate the exact waiting generation"
+        );
+    }
+
+    #[test]
+    fn deferred_parser_bounds_groups_and_rejects_nesting() {
+        let canonical = encode_pending_parts(&[&[10, 1, b'A']]);
+        let waiting = encode_pending_parts(&[&[10, 1, b'B']]);
+        let deferred = encode_deferred_parts(&canonical, &[&waiting]);
+        assert!(deferred_parts(&encode_deferred_parts(&canonical, &[&deferred])).is_err());
+        let mut truncated = DEFERRED_PARTS_HEADER.to_vec();
+        truncated.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert!(deferred_parts(&truncated).is_err());
+        assert!(
+            deferred_parts(&encode_deferred_parts(
+                &canonical,
+                &vec![waiting.as_slice(); retention::MAX_SOURCE_IDENTITIES + 1]
+            ))
+            .is_err()
+        );
+        assert_eq!(
+            pending_parts(&encode_deferred_parts(&[], &[&waiting]))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            pending_parts(&[]).unwrap().len(),
+            1,
+            "empty legacy protobuf remains one message"
+        );
+    }
+
     use super::*;
     use crate::test_utils::create_test_client_with_failing_http;
     use crate::types::message::MessageInfo;

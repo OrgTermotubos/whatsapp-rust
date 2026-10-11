@@ -82,6 +82,7 @@ struct Stanza {
     fresh: Vec<InboundMessage>,
     // End offsets preserve each waiting delivery's multiplicity and order.
     fresh_boundaries: Vec<usize>,
+    persisted_fresh: usize,
     pending_keys: Vec<Key>,
     sources: HashMap<usize, PayloadSources>,
     delivery: Vec<(usize, PayloadSource)>,
@@ -264,7 +265,10 @@ impl Stanza {
                 current_position(item).is_some_and(|index| !retained_positions.insert(index))
             });
         if self.ordering_blocked
-            || ((needs_order || ambiguous) && !self.fresh.is_empty() && !self.delivery.is_empty())
+            || ((needs_order
+                || (ambiguous && (!unproven || overlap || self.fresh.len() < self.delivery.len())))
+                && !self.fresh.is_empty()
+                && !self.delivery.is_empty())
         {
             // Equal plaintext cannot identify an occurrence across encryption
             // generations. Identical ciphertext also identifies multiple wire
@@ -355,6 +359,7 @@ impl Stanza {
             self.items = candidate;
             self.fresh.clear();
             self.fresh_boundaries.clear();
+            self.persisted_fresh = 0;
             self.ordering_blocked = false;
         } else if !self.items.is_empty()
             && !self.fresh.is_empty()
@@ -378,16 +383,23 @@ impl Stanza {
             self.items = ordered.into_values().collect();
             self.fresh.clear();
             self.fresh_boundaries.clear();
+            self.persisted_fresh = 0;
         }
 
         merge_parts(&mut self.items, std::mem::take(&mut self.fresh));
         self.fresh_boundaries.clear();
+        self.persisted_fresh = 0;
         order_sourced_parts(&mut self.items, &self.sources, &self.delivery);
         let live: std::collections::HashSet<_> = self.items.iter().map(part_key).collect();
         self.sources.retain(|key, _| live.contains(key));
         self.current_source = None;
         true
     }
+}
+pub(super) struct PendingOrderSnapshot {
+    pub(super) id: u64,
+    pub(super) fresh_len: usize,
+    pub(super) groups: Vec<Vec<(InboundMessage, PayloadSources)>>,
 }
 #[derive(Default)]
 pub(crate) struct InboundRetention {
@@ -482,6 +494,7 @@ impl InboundRetention {
                 items: Vec::new(),
                 fresh: Vec::new(),
                 fresh_boundaries: Vec::new(),
+                persisted_fresh: 0,
                 pending_keys: Vec::new(),
                 sources: HashMap::new(),
                 delivery: Vec::new(),
@@ -613,13 +626,68 @@ impl InboundRetention {
             .get(&key(info))
             .is_some_and(|stanza| stanza.state == State::AwaitingOrder)
     }
+    pub(super) fn pending_order_snapshot(
+        &self,
+        info: &MessageInfo,
+    ) -> Option<PendingOrderSnapshot> {
+        let stanzas = lock(&self.stanzas);
+        let stanza = stanzas.get(&key(info))?;
+        if stanza.state != State::AwaitingOrder || stanza.fresh.len() == stanza.persisted_fresh {
+            return None;
+        }
+        let group = |parts: &[InboundMessage]| {
+            parts
+                .iter()
+                .map(|item| {
+                    (
+                        item.clone(),
+                        stanza
+                            .sources
+                            .get(&part_key(item))
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect()
+        };
+        let mut groups = vec![group(&stanza.items)];
+        let mut start = stanza.persisted_fresh;
+        for end in stanza
+            .fresh_boundaries
+            .iter()
+            .copied()
+            .chain(std::iter::once(stanza.fresh.len()))
+        {
+            if end > start {
+                groups.push(group(&stanza.fresh[start..end]));
+                start = end;
+            }
+        }
+        Some(PendingOrderSnapshot {
+            id: stanza.id,
+            fresh_len: stanza.fresh.len(),
+            groups,
+        })
+    }
+    pub(super) fn pending_order_persisted(&self, info: &MessageInfo, id: u64, fresh_len: usize) {
+        if let Some(stanza) = lock(&self.stanzas).get_mut(&key(info))
+            && stanza.id == id
+            && stanza.state == State::AwaitingOrder
+        {
+            stanza.persisted_fresh = fresh_len;
+        }
+    }
     pub(crate) fn is_collecting(&self, info: &MessageInfo) -> bool {
         lock(&self.stanzas)
             .get(&key(info))
             .is_some_and(|s| s.state == State::Collecting)
     }
     pub(super) fn seed_replay(&self, replay: durability::PendingReplay) {
-        let Some(first) = replay.items.first() else {
+        let Some(first) = replay
+            .items
+            .first()
+            .or_else(|| replay.waiting.iter().flatten().next())
+        else {
             return;
         };
         let mut stanzas = lock(&self.stanzas);
@@ -639,6 +707,12 @@ impl InboundRetention {
                 }
             }
             merge_parts(&mut stanza.items, replay.items);
+            for waiting in replay.waiting {
+                stanza.fresh.extend(waiting);
+                stanza.fresh_boundaries.push(stanza.fresh.len());
+                stanza.ordering_blocked = true;
+            }
+            stanza.persisted_fresh = stanza.fresh.len();
             stanza.sources.extend(replay.sources);
             stanza.pending_keys.extend(replay.keys);
             stanza.pending_keys.sort_unstable();
@@ -1093,6 +1167,46 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn complete_disjoint_repeated_ciphertexts_append_each_occurrence() {
+        let retention = Arc::new(InboundRetention::default());
+        let first = item("disjoint-repeat", "A");
+        retention.begin(&first.info, None).await;
+        {
+            let mut stanzas = lock(&retention.stanzas);
+            let stanza = stanzas.get_mut(&key(&first.info)).unwrap();
+            stanza.delivery = vec![(0, [1; 32])];
+            stanza.current_source = Some([1; 32]);
+        }
+        retention.stage(std::slice::from_ref(&first), false);
+        assert_eq!(retention.seal(&first.info, false).0.len(), 1);
+        retention.begin(&first.info, None).await;
+        {
+            let mut stanzas = lock(&retention.stanzas);
+            let stanza = stanzas.get_mut(&key(&first.info)).unwrap();
+            stanza.delivery = vec![(0, [2; 32]), (1, [2; 32])];
+            stanza.current_source = Some([2; 32]);
+        }
+        retention.stage(
+            &[item("disjoint-repeat", "B"), item("disjoint-repeat", "B")],
+            false,
+        );
+        let (items, _) = retention.seal(&first.info, false);
+        assert_eq!(
+            items.len(),
+            3,
+            "a complete disjoint frame must not require a missing old anchor"
+        );
+        assert!(Arc::ptr_eq(&items[0].message, &first.message));
+        assert_eq!(
+            items
+                .iter()
+                .map(|part| part.message.conversation.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["A", "B", "B"]
+        );
+    }
+
     #[tokio::test]
     async fn complete_retry_preserves_unknown_fields_in_waiting_fresh_parts() {
         fn marked(id: &str, marker: u8) -> InboundMessage {

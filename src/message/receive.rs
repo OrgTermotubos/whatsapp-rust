@@ -850,6 +850,12 @@ impl Client {
             log::warn!(
                 "Retained pending sequence has ambiguous ciphertext occurrence order; withholding consumer commit and requesting a complete resend"
             );
+            if let Err(error) = self.persist_awaiting_inbound_order(&info).await {
+                log::warn!(
+                    "Cannot persist ambiguously ordered plaintext; retaining it and withholding Signal flush: {error:?}"
+                );
+                return;
+            }
             self.request_retained_order_retry(&info, decrypt_fail_mode);
         } else if !items.is_empty() {
             // Seal after every payload has entered the shared pipeline.

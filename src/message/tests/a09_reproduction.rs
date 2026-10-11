@@ -1862,7 +1862,14 @@ async fn repeated_reencrypted_partial_retry(restart: bool, repeated: bool) {
     f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
     f.receive().await;
     assert_eq!(f.receipts(), 0);
-    assert_eq!(f.pending().await.unwrap(), original_pending);
+    let deferred = f.pending().await.unwrap();
+    assert_eq!(
+        durability::deferred_parts(&deferred)
+            .unwrap()
+            .unwrap()
+            .canonical,
+        original_pending
+    );
     assert!(
         f.client
             .inbound_commit_batch
@@ -1904,31 +1911,22 @@ async fn repeated_reencrypted_partial_retry(restart: bool, repeated: bool) {
     };
     f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
     f.hook.fail.store(false, Ordering::SeqCst);
-    let retry_pending = f.pending().await.unwrap();
+    if restart {
+        // The deferred row now retains the re-encrypted waiting generation.
+        // Restoring B completes that exact generation after restart; keep the
+        // hook failing first to inspect the durable ordered record.
+        f.hook.fail.store(true, Ordering::SeqCst);
+    }
     f.receive().await;
     if restart {
-        assert!(
-            f.published().is_empty(),
-            "restart must not guess re-encrypted occurrence order"
-        );
+        assert!(f.published().is_empty());
         assert_eq!(f.receipts(), 0);
-        assert_eq!(f.pending().await.unwrap(), retry_pending);
         assert!(
-            f.client
+            !f.client
                 .inbound_commit_batch
                 .retention
                 .awaiting_order(&f.info)
         );
-        // The in-memory fresh generation was not persisted before restart.
-        // Complete newly encrypted delivery proves order without weakening
-        // retained-byte preservation or committing the ambiguous partial row.
-        let complete = p1_group_parts(&mut peer, &group, &f.info.id, &bodies).await;
-        // Keep the retry's participant spelling. Switching it here would add
-        // another physical receipt identity unrelated to occurrence ordering.
-        f.stanza = with_participant(&complete, &f.info.source.sender);
-        f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
-        f.hook.fail.store(true, Ordering::SeqCst);
-        f.receive().await;
         let persisted = f.pending().await.unwrap();
         let old_parts = durability::pending_parts(&original_pending).unwrap();
         let new_parts = durability::pending_parts(&persisted).unwrap();
@@ -1975,7 +1973,12 @@ async fn reencrypted_partial_retry_keeps_repeated_payloads_after_restart() {
     repeated_reencrypted_partial_retry(true, true).await;
 }
 
-async fn legacy_partial_ciphertext_order(leading_repeat: bool, legacy_format: bool, carrier: bool) {
+async fn legacy_partial_ciphertext_order(
+    leading_repeat: bool,
+    legacy_format: bool,
+    carrier: bool,
+    restart_ambiguous: bool,
+) {
     let mut f = Fixture::new("PARTIAL_CIPHERTEXT_ORDER", false).await;
     let group: Jid = "120363000000000032@g.us".parse().unwrap();
     let mut peer = joined_group_sender(&f.client, "100000000000032:75@lid", &group).await;
@@ -2069,9 +2072,12 @@ async fn legacy_partial_ciphertext_order(leading_repeat: bool, legacy_format: bo
         );
         assert_eq!(f.receipts(), 0);
         assert_eq!(
-            f.pending().await.unwrap(),
+            durability::deferred_parts(&f.pending().await.unwrap())
+                .unwrap()
+                .unwrap()
+                .canonical,
             legacy,
-            "preserve the original opaque row"
+            "preserve the original opaque canonical row inside the deferred envelope"
         );
         assert!(
             f.client
@@ -2079,6 +2085,17 @@ async fn legacy_partial_ciphertext_order(leading_repeat: bool, legacy_format: bo
                 .retention
                 .awaiting_order(&f.info)
         );
+        if restart_ambiguous {
+            f.client.flush_signal_cache_batch_safe().await.unwrap();
+            f.restart().await;
+            f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
+            f.receive().await;
+            assert!(
+                f.published().is_empty(),
+                "restart must not commit the incomplete legacy row after consuming the recovered B key"
+            );
+            assert_eq!(f.receipts(), 0);
+        }
         let mut replay = f
             .client
             .load_pending_inbound(&Arc::new(f.info.clone()))
@@ -2176,11 +2193,11 @@ async fn legacy_partial_ciphertext_order(leading_repeat: bool, legacy_format: bo
 
 #[tokio::test]
 async fn legacy_partial_retry_preserves_middle_occurrence() {
-    legacy_partial_ciphertext_order(false, true, false).await;
+    legacy_partial_ciphertext_order(false, true, false, false).await;
 }
 #[tokio::test]
 async fn legacy_partial_retry_preserves_leading_repeat() {
-    legacy_partial_ciphertext_order(true, true, false).await;
+    legacy_partial_ciphertext_order(true, true, false, false).await;
 }
 
 #[tokio::test]
@@ -2243,12 +2260,12 @@ async fn mixed_bot_and_signal_parts_keep_wire_order() {
 
 #[tokio::test]
 async fn sourced_partial_retry_preserves_leading_repeat() {
-    legacy_partial_ciphertext_order(true, false, false).await;
+    legacy_partial_ciphertext_order(true, false, false, false).await;
 }
 
 #[tokio::test]
 async fn legacy_partial_retry_accepts_complete_resend_with_skdm_carrier() {
-    legacy_partial_ciphertext_order(false, true, true).await;
+    legacy_partial_ciphertext_order(false, true, true, false).await;
 }
 #[tokio::test]
 async fn compatible_alias_rows_combine_ciphertext_histories() {
@@ -2410,4 +2427,9 @@ async fn identical_bot_ciphertexts_keep_repeated_occurrences_after_retry() {
     assert_eq!(f.published(), ["B", "B", "C"]);
     assert_eq!(f.receipts(), 1);
     assert!(f.pending().await.is_none());
+}
+
+#[tokio::test]
+async fn ambiguous_legacy_partial_survives_signal_flush_and_restart() {
+    legacy_partial_ciphertext_order(false, true, false, true).await;
 }
