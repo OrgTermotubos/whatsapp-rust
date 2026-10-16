@@ -7,10 +7,14 @@ access. The connected fixture's service limitations and certificate policy are
 documented in `connected_idle.md`.
 
 `appstate_prefetch` registers the same prefetch fixture with Divan and the
-existing CodSpeed client shard. It reports verified bytes per batch. Its native
+existing CodSpeed client shard, with one-client and eight-client rows. The latter
+uses four runtime workers and four blobs per client. It reports verified bytes per batch. Its native
 allocation profiler and CodSpeed instruments provide ongoing allocation/CPU
 coverage. Use the separate diagnostic executables for uninstrumented walltime
 and requested-heap comparisons.
+Native Divan allocation columns exclude executor and blocking threads outside
+Divan's control. Use the global DHAT probe for concurrent heap measurements.
+CodSpeed uses its own instruments; compare matching instruments and environments.
 
 Build each revision with the same toolchain, lockfile, profile and features.
 When comparing older revisions, apply exactly the same additive probe sources
@@ -63,6 +67,9 @@ adapter accepts both the old byte map and the new fallible byte map, preserving
 download errors while letting identical sources compile against both revisions.
 Worker and client arguments describe the executor topology. Record the actual
 desktop, virtual machine or server hardware separately.
+For standalone media, the client argument counts simultaneous downloads sharing
+the immutable HTTP input. Send fixtures check success through the encrypted sink;
+remote delivery is outside their scope.
 
 ## Timing and memory boundaries
 
