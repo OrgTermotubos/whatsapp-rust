@@ -62,6 +62,10 @@ pub enum DownloadPolicyError {
     LimitExceeded { domain: MediaByteDomain, limit: u64 },
     #[error("bounded media downloads require a streaming HTTP adapter")]
     StreamingRequired,
+    #[error("media buffer memory budget exceeded ({limit} bytes)")]
+    MemoryBudgetExceeded { limit: usize },
+    #[error("could not allocate the media buffer")]
+    AllocationFailed,
     #[error("media download cancelled")]
     Cancelled,
 }
@@ -96,6 +100,17 @@ pub(super) struct DownloadBudget {
 }
 
 impl DownloadBudget {
+    pub(super) fn cancellable(limits: DownloadLimits) -> Self {
+        Self {
+            limits,
+            state: Some(Arc::new(Mutex::new(State::default()))),
+        }
+    }
+
+    pub(super) fn is_bounded(&self) -> bool {
+        self.limits.is_bounded()
+    }
+
     pub(super) fn new(limits: DownloadLimits) -> Self {
         Self {
             limits,

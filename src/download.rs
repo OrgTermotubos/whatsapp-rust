@@ -10,19 +10,19 @@ use wacore::runtime::Runtime;
 use wacore::sync_marker::MaybeSend;
 
 mod budget;
+pub(crate) mod memory;
 use budget::{BudgetPolicyCause, DownloadBudget};
 pub use budget::{DownloadLimits, DownloadPolicyError, MediaByteDomain};
+use memory::MemoryWriter;
 
 pub use wacore::download::{
     DEFAULT_MEDIA_HOSTS, DownloadPreparationError, DownloadUtils, DownloadWriter, Downloadable,
     MediaDecryption, MediaDecryptionError, MediaHost, MediaRoute, MediaType,
 };
 
-/// Cap on the speculative capacity pre-allocated for the in-memory download
-/// buffer. Sized to the plaintext length the message declares, but a bogus
-/// length must not drive a multi-GB allocation before a single byte arrives;
-/// beyond this the buffer grows on demand. Comfortably above typical
-/// image/video/audio media so the common case is a single allocation.
+/// Cap on the speculative capacity chosen from the declared plaintext length.
+/// The buffer stays empty until the first output write, then reserves fallibly.
+/// Larger bodies grow on demand.
 const DOWNLOAD_PREALLOC_CAP: u64 = 64 * 1024 * 1024;
 
 impl From<&MediaConn> for MediaRoute {
@@ -485,6 +485,18 @@ impl DownloadRequestError {
     }
 
     fn streamed(error: anyhow::Error) -> Self {
+        if let Some(policy) = error.chain().find_map(|cause| {
+            cause
+                .downcast_ref::<memory::MemoryPolicyCause>()
+                .or_else(|| {
+                    cause
+                        .downcast_ref::<std::io::Error>()?
+                        .get_ref()?
+                        .downcast_ref::<memory::MemoryPolicyCause>()
+                })
+        }) {
+            return Self::ResourcePolicy(policy.0);
+        }
         let tagged = error
             .downcast_ref::<std::io::Error>()
             .and_then(std::io::Error::get_ref)
@@ -784,14 +796,27 @@ async fn execute_request_into_memory(
     hashes: ExpectedMediaHashes,
     capacity: usize,
 ) -> std::result::Result<Vec<u8>, DownloadRequestError> {
+    let mut hashes = hashes;
+    let cancellation = hashes
+        .budget
+        .is_none()
+        .then(|| DownloadBudget::cancellable(DownloadLimits::default()));
+    let _cancel = CancelDownloadOnDrop(cancellation.clone());
+    if let Some(budget) = cancellation {
+        hashes.budget = Some(budget);
+    }
     if http_client.supports_streaming() {
-        let writer = std::io::Cursor::new(Vec::with_capacity(capacity));
+        let writer = MemoryWriter::new(capacity, None);
         match streaming_download_and_decrypt(http_client, runtime, request, hashes, writer).await {
-            Ok((writer, Ok(()))) => Ok(writer.into_inner()),
+            Ok((writer, Ok(()))) => Ok(writer.into_parts().0),
             Ok((_, Err(e))) => Err(e),
             Err(e) => Err(DownloadRequestError::other(e)),
         }
-    } else if hashes.budget.is_some() {
+    } else if hashes
+        .budget
+        .as_ref()
+        .is_some_and(DownloadBudget::is_bounded)
+    {
         Err(DownloadRequestError::ResourcePolicy(
             DownloadPolicyError::StreamingRequired,
         ))
@@ -1147,6 +1172,33 @@ impl Client {
             .into());
         }
         let budget = limits.is_bounded().then(|| DownloadBudget::new(limits));
+        self.download_to_writer_with_budget(downloadable, writer, budget)
+            .await
+    }
+
+    pub(crate) async fn download_with_memory_budget(
+        &self,
+        downloadable: &dyn Downloadable,
+        memory: memory::MemoryBudget,
+    ) -> std::result::Result<MemoryWriter, ClientDownloadError> {
+        if !self.http_client.supports_streaming() {
+            return Err(DownloadPolicyError::StreamingRequired.into());
+        }
+        let writer = MemoryWriter::bounded(downloadable.file_length().unwrap_or(0), memory)?;
+        self.download_to_writer_with_budget(
+            downloadable,
+            writer,
+            Some(DownloadBudget::cancellable(DownloadLimits::default())),
+        )
+        .await
+    }
+
+    async fn download_to_writer_with_budget<W: DownloadWriter + MaybeSend + 'static>(
+        &self,
+        downloadable: &dyn Downloadable,
+        writer: W,
+        budget: Option<DownloadBudget>,
+    ) -> std::result::Result<W, ClientDownloadError> {
         let _cancel = CancelDownloadOnDrop(budget.clone());
         let budget = &budget;
 
@@ -1424,7 +1476,17 @@ async fn buffered_download_to_vec(
     let mut body = buffered_download_body(http_client, request).await?;
     let decryption = request.decryption.clone();
     wacore::runtime::blocking(&**runtime, move || {
+        if let Some(budget) = &hashes.budget {
+            budget
+                .check_cancelled()
+                .map_err(DownloadRequestError::ResourcePolicy)?;
+        }
         decrypt_or_validate_buffered_body(&mut body, &decryption, &hashes)?;
+        if let Some(budget) = &hashes.budget {
+            budget
+                .check_cancelled()
+                .map_err(DownloadRequestError::ResourcePolicy)?;
+        }
         Ok(body)
     })
     .await

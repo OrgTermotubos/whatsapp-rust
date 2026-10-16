@@ -6,18 +6,53 @@ use crate::request::DEFAULT_IQ_TIMEOUT;
 use std::borrow::Cow;
 use wacore::appstate_sync::AppStateMutationPersistence;
 
+pub(crate) struct AppStateDownloads {
+    config: crate::AppStateDownloadConfig,
+    budget: crate::download::memory::MemoryBudget,
+}
+
+impl AppStateDownloads {
+    pub(crate) fn new(config: crate::AppStateDownloadConfig) -> Self {
+        Self {
+            config,
+            budget: crate::download::memory::MemoryBudget::new(config.max_bytes()),
+        }
+    }
+}
+
+type PrefetchedBlobs =
+    HashMap<String, std::result::Result<bytes::Bytes, Arc<crate::download::ClientDownloadError>>>;
+
+#[derive(Debug)]
+struct BlobDownloadFailure(Arc<crate::download::ClientDownloadError>);
+
+impl std::fmt::Display for BlobDownloadFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.0.as_ref(), formatter)
+    }
+}
+
+impl std::error::Error for BlobDownloadFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // Arc delegates source() past the concrete error. Preserve its type so
+        // the collection caller can recover the download classification too.
+        Some(self.0.as_ref())
+    }
+}
+
 fn external_blob_resolver(
-    blobs: &HashMap<String, bytes::Bytes>,
+    blobs: &PrefetchedBlobs,
 ) -> impl Fn(&wa::ExternalBlobReference) -> Result<bytes::Bytes> + '_ {
     move |ext| {
         let path = ext
             .direct_path
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("external blob has no directPath"))?;
-        blobs
-            .get(path)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("external blob not pre-downloaded: {path}"))
+        match blobs.get(path) {
+            Some(Ok(blob)) => Ok(blob.clone()),
+            Some(Err(error)) => Err(BlobDownloadFailure(error.clone()).into()),
+            None => Err(anyhow::anyhow!("external blob not pre-downloaded: {path}")),
+        }
     }
 }
 
@@ -55,11 +90,6 @@ impl AppStateMutationPersistence for AppStateClientPersistence {
     }
 }
 
-/// Concurrency cap for pre-downloading app-state external blobs (independent CDN
-/// GETs, keyed by directPath — LTHash ordering is in patch application, not blob
-/// fetching). WA Web fans these out under `Promise.all` (`Syncd/CollectionHandler`);
-/// bounded here because a snapshot can be multi-MB and a batch carries several.
-const APPSTATE_BLOB_DOWNLOAD_CONCURRENCY: usize = 4;
 const APP_STATE_KEY_REQUEST_DEDUP: Duration = Duration::from_secs(24 * 3600);
 const APP_STATE_KEY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const APP_STATE_KEY_PARTIAL_RETRY: Duration = Duration::from_secs(10);
@@ -880,13 +910,12 @@ impl Client {
 
     /// Pre-download every external blob (snapshots + patch external mutations)
     /// referenced by `patch_lists`, keyed by directPath, fetching concurrently
-    /// (bounded by [`APPSTATE_BLOB_DOWNLOAD_CONCURRENCY`]). A failed download is
-    /// logged and omitted; the later inline step surfaces the missing blob as
-    /// before. Mirrors WA Web's parallel syncd blob fetch.
+    /// under the configured concurrency and shared capacity budget. Failures
+    /// retain their source for the collection processor.
     async fn pre_download_external_blobs(
         &self,
         patch_lists: &[wacore::appstate::patch_decode::PatchList],
-    ) -> HashMap<String, bytes::Bytes> {
+    ) -> PrefetchedBlobs {
         use futures::StreamExt;
 
         // Kept only so a failed download logs the right message (snapshot vs patch).
@@ -927,41 +956,41 @@ impl Client {
             return HashMap::new();
         }
 
+        let policy = &self.cache_config.app_state_downloads;
         let mut pre_downloaded = HashMap::with_capacity(jobs.len());
         let results = futures::stream::iter(jobs.into_iter().map(|(ext, kind)| async move {
-            let bytes = self.download(&ext, Default::default()).await;
-            // directPath presence was checked when the job was built.
-            (ext.direct_path, kind, bytes)
+            let result = async {
+                let writer = self
+                    .download_with_memory_budget(&ext, policy.budget.clone())
+                    .await?;
+                Ok::<_, crate::download::ClientDownloadError>(writer.into_bytes())
+            }
+            .await;
+            (ext.direct_path, kind, result)
         }))
-        .buffer_unordered(APPSTATE_BLOB_DOWNLOAD_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
-
-        for (path, kind, res) in results {
-            match res {
-                Ok(bytes) => {
-                    if let BlobKind::Mutation(v) = kind {
-                        debug!(target: "Client/AppState", "Downloaded external mutations for patch v{} ({} bytes)", v, bytes.len());
-                    } else {
-                        debug!(target: "Client/AppState", "Downloaded external snapshot ({} bytes)", bytes.len());
+        .buffer_unordered(policy.config.concurrency().get());
+        futures::pin_mut!(results);
+        while let Some((path, kind, result)) = results.next().await {
+            match &result {
+                Ok(bytes) => match kind {
+                    BlobKind::Mutation(version) => {
+                        debug!(target: "Client/AppState", "Downloaded external mutations for patch v{} ({} bytes)", version, bytes.len())
                     }
-                    if let Some(path) = path {
-                        // `Bytes::from(Vec)` moves; the resolvers below then
-                        // hand out refcounts instead of copying the blob.
-                        pre_downloaded.insert(path, bytes::Bytes::from(bytes));
-                    }
-                }
-                Err(e) => match kind {
-                    BlobKind::Snapshot(name) => {
-                        warn!("Failed to download external snapshot for {:?}: {e}", name)
-                    }
-                    BlobKind::Mutation(v) => {
-                        warn!(
-                            "Failed to download external mutations for patch v{}: {e}",
-                            v
-                        )
+                    BlobKind::Snapshot(_) => {
+                        debug!(target: "Client/AppState", "Downloaded external snapshot ({} bytes)", bytes.len())
                     }
                 },
+                Err(error) => match kind {
+                    BlobKind::Snapshot(name) => {
+                        warn!("Failed to download external snapshot for {name:?}: {error}")
+                    }
+                    BlobKind::Mutation(version) => {
+                        warn!("Failed to download external mutations for patch v{version}: {error}")
+                    }
+                },
+            }
+            if let Some(path) = path {
+                pre_downloaded.insert(path, result.map_err(Arc::new));
             }
         }
 
@@ -4738,7 +4767,10 @@ mod tests {
 
     #[test]
     fn external_blob_resolution_preserves_bytes_and_missing_path_errors() {
-        let blobs = HashMap::from([("/snapshot".into(), bytes::Bytes::from_static(b"snapshot"))]);
+        let blobs = HashMap::from([(
+            "/snapshot".into(),
+            Ok(bytes::Bytes::from_static(b"snapshot")),
+        )]);
         let resolve = external_blob_resolver(&blobs);
         let mut reference = wa::ExternalBlobReference::default();
         assert_eq!(
@@ -4752,8 +4784,11 @@ mod tests {
         );
         reference.direct_path = Some("/snapshot".into());
         let resolved = resolve(&reference).unwrap();
-        assert_eq!(resolved, blobs["/snapshot"]);
-        assert_eq!(resolved.as_ptr(), blobs["/snapshot"].as_ptr());
+        assert_eq!(resolved, *blobs["/snapshot"].as_ref().unwrap());
+        assert_eq!(
+            resolved.as_ptr(),
+            blobs["/snapshot"].as_ref().unwrap().as_ptr()
+        );
     }
 
     #[tokio::test]
@@ -9377,3 +9412,7 @@ mod critical_bootstrap_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "app_state/download_memory_tests.rs"]
+mod download_memory_tests;
