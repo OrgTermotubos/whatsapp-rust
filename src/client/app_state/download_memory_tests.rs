@@ -376,7 +376,7 @@ async fn cancelling_active_prefetch_stops_io_and_releases_its_reservation() {
         .await
         .unwrap();
     assert_eq!(
-        client.cache_config.app_state_downloads.budget.used(),
+        client.cache_config.app_state_downloads.budget().used(),
         32 * 1024
     );
     task.abort();
@@ -386,5 +386,14 @@ async fn cancelling_active_prefetch_stops_io_and_releases_its_reservation() {
         .await
         .unwrap();
     assert_eq!(reads.load(Ordering::SeqCst), 2);
-    assert_eq!(client.cache_config.app_state_downloads.budget.used(), 0);
+    assert_eq!(client.cache_config.app_state_downloads.budget().used(), 0);
+}
+
+#[test]
+fn blob_budget_is_lazy_and_shared_between_callers() {
+    let policy = AppStateDownloads::new(crate::AppStateDownloadConfig::default());
+    assert!(policy.budget.get().is_none());
+    let first = policy.budget();
+    assert!(std::ptr::eq(first, policy.budget()));
+    assert_eq!(first.used(), 0);
 }

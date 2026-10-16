@@ -541,9 +541,8 @@ impl Default for CacheConfig {
 /// holds the full construction config. Only the group-cache store is kept:
 /// the device-registry and LID-PN stores are owned by their live caches after
 /// construction, and keeping another `Arc` here would pin them for no reason.
-#[derive(Clone)]
 pub(crate) struct RuntimeCacheConfig {
-    pub(crate) app_state_downloads: Arc<crate::client::AppStateDownloads>,
+    pub(crate) app_state_downloads: crate::client::AppStateDownloads,
     pub(crate) group_cache: CacheEntryConfig,
     pub(crate) group_cache_store: Option<Arc<dyn CacheStore>>,
     pub(crate) recent_messages_enabled: bool,
@@ -558,9 +557,7 @@ pub(crate) struct RuntimeCacheConfig {
 impl From<&CacheConfig> for RuntimeCacheConfig {
     fn from(config: &CacheConfig) -> Self {
         Self {
-            app_state_downloads: Arc::new(crate::client::AppStateDownloads::new(
-                config.app_state_downloads,
-            )),
+            app_state_downloads: crate::client::AppStateDownloads::new(config.app_state_downloads),
             group_cache: config.group_cache.clone(),
             group_cache_store: config.cache_stores.group_cache.clone(),
             recent_messages_enabled: config.recent_messages.capacity > 0,
@@ -605,8 +602,7 @@ mod tests {
             size_of::<CacheConfig>()
         );
         assert!(
-            size_of::<RuntimeCacheConfig>()
-                <= 136 + size_of::<Arc<crate::client::AppStateDownloads>>(),
+            size_of::<RuntimeCacheConfig>() <= 136 + size_of::<crate::client::AppStateDownloads>(),
             "runtime config grew to {} B beyond the base and shared blob policy",
             size_of::<RuntimeCacheConfig>()
         );

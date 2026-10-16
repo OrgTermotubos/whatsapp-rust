@@ -11,15 +11,20 @@ use wacore::appstate_sync::AppStateMutationPersistence;
 
 pub(crate) struct AppStateDownloads {
     config: crate::AppStateDownloadConfig,
-    budget: crate::download::memory::MemoryBudget,
+    budget: std::sync::OnceLock<crate::download::memory::MemoryBudget>,
 }
 
 impl AppStateDownloads {
     pub(crate) fn new(config: crate::AppStateDownloadConfig) -> Self {
         Self {
             config,
-            budget: crate::download::memory::MemoryBudget::new(config.max_bytes()),
+            budget: std::sync::OnceLock::new(),
         }
+    }
+
+    fn budget(&self) -> &crate::download::memory::MemoryBudget {
+        self.budget
+            .get_or_init(|| crate::download::memory::MemoryBudget::new(self.config.max_bytes()))
     }
 }
 
@@ -928,7 +933,7 @@ impl Client {
         ),
     > + '_ {
         let prepared = self
-            .prepare_memory_download(&ext, self.cache_config.app_state_downloads.budget.clone());
+            .prepare_memory_download(&ext, self.cache_config.app_state_downloads.budget().clone());
         async move {
             let result = match prepared {
                 Ok(writer) => Box::pin(self.download_prepared_memory(&ext, writer))
