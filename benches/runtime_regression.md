@@ -102,3 +102,18 @@ interval spanning no change is inconclusive.
 Keep builds and other benchmark processes out of timing runs. Record CPU,
 governor, affinity, background load, allocator environment, revision hashes and
 exact commands. Never infer a universal throughput gain from smaller futures.
+
+## Pull request automation
+
+The CodSpeed workflow runs the registered Divan CPU and memory comparisons on
+pull requests and main. The separate `Native runtime probes` workflow runs
+`cargo xt ci runtime-probes --out-dir runtime-probe-results` on the same events.
+It executes three fresh processes for each selected timing and global DHAT case,
+including eight-client prefetch and file-backed SQLite with one client. The
+artifact contains raw JSONL, stderr, revision, compiler, CPU and executable hashes.
+Any workload failure fails the job and preserves its diagnostic output.
+
+Native walltime on shared runners is observational. Compare matching main and
+PR artifacts with their host metadata; CodSpeed remains the deterministic CPU
+comparison. Neither workflow treats reduced allocation counts as proof of lower
+latency or suppresses cryptographic and persistence failures.
