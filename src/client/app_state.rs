@@ -20,6 +20,11 @@ impl AppStateDownloads {
     }
 }
 
+enum BlobKind {
+    Snapshot(WAPatchName),
+    Mutation(u64),
+}
+
 type PrefetchedBlobs =
     HashMap<String, std::result::Result<bytes::Bytes, Arc<crate::download::ClientDownloadError>>>;
 
@@ -908,6 +913,30 @@ impl Client {
         })
     }
 
+    fn external_blob_job(
+        &self,
+        ext: wa::ExternalBlobReference,
+        kind: BlobKind,
+    ) -> impl Future<
+        Output = (
+            Option<String>,
+            BlobKind,
+            std::result::Result<bytes::Bytes, crate::download::ClientDownloadError>,
+        ),
+    > + '_ {
+        let prepared = self
+            .prepare_memory_download(&ext, self.cache_config.app_state_downloads.budget.clone());
+        async move {
+            let result = match prepared {
+                Ok(writer) => Box::pin(self.download_prepared_memory(&ext, writer))
+                    .await
+                    .map(crate::download::memory::MemoryWriter::into_bytes),
+                Err(error) => Err(error),
+            };
+            (ext.direct_path, kind, result)
+        }
+    }
+
     /// Pre-download every external blob (snapshots + patch external mutations)
     /// referenced by `patch_lists`, keyed by directPath, fetching concurrently
     /// under the configured concurrency and shared capacity budget. Failures
@@ -917,12 +946,6 @@ impl Client {
         patch_lists: &[wacore::appstate::patch_decode::PatchList],
     ) -> PrefetchedBlobs {
         use futures::StreamExt;
-
-        // Kept only so a failed download logs the right message (snapshot vs patch).
-        enum BlobKind {
-            Snapshot(WAPatchName),
-            Mutation(u64),
-        }
 
         // Clone the (small) blob ref into each job so the task owns its input and
         // captures only `&self` (keeps the future Send); the directPath is
@@ -958,16 +981,11 @@ impl Client {
 
         let policy = &self.cache_config.app_state_downloads;
         let mut pre_downloaded = HashMap::with_capacity(jobs.len());
-        let results = futures::stream::iter(jobs.into_iter().map(|(ext, kind)| async move {
-            let result = async {
-                let writer = self
-                    .download_with_memory_budget(&ext, policy.budget.clone())
-                    .await?;
-                Ok::<_, crate::download::ClientDownloadError>(writer.into_bytes())
-            }
-            .await;
-            (ext.direct_path, kind, result)
-        }))
+        // Refused references never allocate a download coroutine.
+        let results = futures::stream::iter(
+            jobs.into_iter()
+                .map(|(ext, kind)| self.external_blob_job(ext, kind)),
+        )
         .buffer_unordered(policy.config.concurrency().get());
         futures::pin_mut!(results);
         while let Some((path, kind, result)) = results.next().await {
@@ -2015,7 +2033,7 @@ impl Client {
             return Ok(outcome);
         }
 
-        self.sync_collections_batched_inner(pending, scope, request, &mut outcome)
+        Box::pin(self.sync_collections_batched_inner(pending, scope, request, &mut outcome))
             .await?;
 
         // A run that crossed its deadline is not a clean one, even if every
@@ -2163,7 +2181,7 @@ impl Client {
             // and an IQ that errors or times out spent one just as much as one
             // that answered.
             outcome.note_reached_server();
-            let resp = match self.send_iq(iq).await {
+            let resp = match Box::pin(self.send_iq(iq)).await {
                 Ok(resp) => resp,
                 // Losing the transport is what the buckets are for, not what an
                 // error is for: the collections this round was carrying are not
@@ -2264,7 +2282,9 @@ impl Client {
             // (initial bootstrap), so a late/never-auto-shared key still recovers via
             // the explicit request on this connection; otherwise a fixed short wait.
             let key_wait = scope.remaining().unwrap_or(APP_STATE_KEY_REQUEST_TIMEOUT);
-            if !missing_all.is_empty() && !self.request_keys_and_wait(missing_all, key_wait).await {
+            if !missing_all.is_empty()
+                && !Box::pin(self.request_keys_and_wait(missing_all, key_wait)).await
+            {
                 // The re-shared key didn't land in time. Nothing in this round can
                 // be decoded, so report every collection still pending as
                 // retryable rather than as synced: they re-sync on a later cycle
@@ -2319,7 +2339,7 @@ impl Client {
                     break;
                 }
                 let name = pl.name;
-                match proc.process_one_patch_list(pl, &download, true).await {
+                match Box::pin(proc.process_one_patch_list(pl, &download, true)).await {
                     Ok(applied) => results.push(applied),
                     Err(e) => {
                         // Named here or nowhere: the loop stops on the first
@@ -2346,7 +2366,7 @@ impl Client {
             // them.
             let mut answered: HashSet<WAPatchName> = HashSet::new();
 
-            for (mutations, new_state, list) in results {
+            for (ref mut mutations, ref new_state, ref list) in results {
                 let name = list.name;
                 answered.insert(name);
 
@@ -2413,15 +2433,17 @@ impl Client {
                 }
 
                 // Handle missing keys
-                let missing = match proc.get_missing_key_ids(&list).await {
+                let missing = match proc.get_missing_key_ids(list).await {
                     Ok(v) => v,
                     Err(e) => {
                         warn!("Failed to get missing key IDs for {:?}: {}", name, e);
                         Vec::new()
                     }
                 };
-                self.request_missing_keys_with_dedup(&missing, APP_STATE_KEY_REQUEST_DEDUP)
-                    .await;
+                Box::pin(
+                    self.request_missing_keys_with_dedup(&missing, APP_STATE_KEY_REQUEST_DEDUP),
+                )
+                .await;
 
                 // full_sync marks a rebuild rather than a live change, so it is
                 // true for every page of a replay a snapshot started — not only
@@ -2429,27 +2451,14 @@ impl Client {
                 // fetching patches for an already-synced collection never enters
                 // the set, which is what keeps it from reading as a full sync.
                 let full_sync = replaying_snapshot.contains(&name);
-                wacore::telemetry::appstate_mutations(mutations.len() as u64);
-                // `new_state.version` is the version *after* this page: a page
-                // can carry a snapshot plus several patches, so mutations
-                // from the earlier pieces did not arrive at this version.
-                // They still share one per-mutation version rather than one
-                // each, because `process_patch_list` concatenates them and
-                // returns only the final state — tracking the originating
-                // version per mutation would thread a parallel `Vec<u64>`
-                // through the processor, the telemetry and every dispatch
-                // caller for a distinction the per-patch `Decoded … vN`
-                // lines already draw. The version below is therefore the
-                // page's end cursor, not each mutation's birth version.
-                let total = mutations.len();
-                for (position, mut m) in mutations.into_iter().enumerate() {
-                    self.dispatch_app_state_mutation(
-                        &mut m,
-                        full_sync,
-                        (name, new_state.version, position + 1, total),
-                    )
-                    .await;
-                }
+                Box::pin(self.dispatch_collection_mutations(
+                    std::mem::take(mutations),
+                    name,
+                    new_state.version,
+                    full_sync,
+                    full_sync,
+                ))
+                .await;
 
                 // No version write here. `process_one_patch_list` already
                 // persisted this exact state — alongside the mutation MACs it
@@ -2508,7 +2517,7 @@ impl Client {
                 let error = self
                     .dispatch_committed_mutations_from_error(error, full_sync, full_sync)
                     .await;
-                self.escalate_to_snapshot_recovery(name, &error).await;
+                Box::pin(self.escalate_to_snapshot_recovery(name, &error)).await;
                 return Err(error);
             }
 
@@ -2797,14 +2806,23 @@ impl Client {
                 return true;
             }
 
-            let request = self.request_missing_keys_with_dedup(&missing, retry_after);
-            let schedule = match self
-                .await_app_state_key_request(&*backend, &missing, deadline, listener, request)
-                .await
-            {
-                AppStateKeyRequestProgress::Scheduled(schedule) => schedule,
-                AppStateKeyRequestProgress::KeysReady => return true,
-                AppStateKeyRequestProgress::TimedOut => return false,
+            let schedule = {
+                let mut request =
+                    Box::pin(self.request_missing_keys_with_dedup(&missing, retry_after));
+                match self
+                    .await_app_state_key_request(
+                        &*backend,
+                        &missing,
+                        deadline,
+                        listener,
+                        request.as_mut(),
+                    )
+                    .await
+                {
+                    AppStateKeyRequestProgress::Scheduled(schedule) => schedule,
+                    AppStateKeyRequestProgress::KeysReady => return true,
+                    AppStateKeyRequestProgress::TimedOut => return false,
+                }
             };
             if schedule.sent {
                 debug!(target: "Client/AppState", "Requested {} missing app-state key(s); retrying after {retry_after:?} if no share arrives", missing.len());
@@ -2987,7 +3005,7 @@ impl Client {
         if raw_key_ids.is_empty() {
             return Ok(AppStateKeyRequestDelivery::AllPeers);
         }
-        let peers = self.app_state_key_request_peers().await?;
+        let peers = Box::pin(self.app_state_key_request_peers()).await?;
         let key_ids: Vec<wa::message::AppStateSyncKeyId> = raw_key_ids
             .iter()
             .map(|k| {
@@ -4388,6 +4406,29 @@ fn log_mutation_dispatched(
 }
 
 impl Client {
+    async fn dispatch_collection_mutations(
+        &self,
+        mutations: Vec<crate::appstate_sync::Mutation>,
+        collection: WAPatchName,
+        version: u64,
+        event_full_sync: bool,
+        log_full_sync: bool,
+    ) {
+        wacore::telemetry::appstate_mutations(mutations.len() as u64);
+        let total = mutations.len();
+        // Borrow the iterator's yielded value so the coroutine owns one mutation,
+        // not both the iterator temporary and a moved copy across dispatch.
+        for (position, ref mut mutation) in mutations.into_iter().enumerate() {
+            self.dispatch_app_state_mutation_inner(
+                mutation,
+                event_full_sync,
+                log_full_sync,
+                Some((collection, version, position + 1, total)),
+            )
+            .await;
+        }
+    }
+
     async fn dispatch_committed_mutations_from_error(
         &self,
         error: anyhow::Error,
@@ -4399,17 +4440,14 @@ impl Client {
             Err(error) => return error,
         };
         let (mutations, state, collection, source) = committed.into_parts();
-        wacore::telemetry::appstate_mutations(mutations.len() as u64);
-        let total = mutations.len();
-        for (position, mut mutation) in mutations.into_iter().enumerate() {
-            self.dispatch_app_state_mutation_inner(
-                &mut mutation,
-                event_full_sync,
-                log_full_sync,
-                Some((collection, state.version, position + 1, total)),
-            )
-            .await;
-        }
+        Box::pin(self.dispatch_collection_mutations(
+            mutations,
+            collection,
+            state.version,
+            event_full_sync,
+            log_full_sync,
+        ))
+        .await;
         source
     }
 
@@ -4540,9 +4578,11 @@ impl Client {
         if m.index[0] == "nct_salt_sync" {
             let outcome = if m.operation == wa::syncd_mutation::SyncdOperation::Remove {
                 debug!(target: "Client/AppState", "Removing NCT salt via app state sync");
-                self.persistence_manager
-                    .process_command(DeviceCommand::SetNctSalt(None))
-                    .await;
+                Box::pin(
+                    self.persistence_manager
+                        .process_command(DeviceCommand::SetNctSalt(None)),
+                )
+                .await;
                 AppStateDispatchOutcome::Event("NctSaltCleared")
             } else if let Some(val) = &m.action_value
                 && let Some(act) = val.nct_salt_sync_action.as_option()
@@ -4553,9 +4593,11 @@ impl Client {
                     AppStateDispatchOutcome::Skipped("empty-salt")
                 } else {
                     debug!(target: "Client/AppState", "Stored NCT salt via app state sync ({} bytes)", salt.len());
-                    self.persistence_manager
-                        .process_command(DeviceCommand::SetNctSalt(Some(salt.clone())))
-                        .await;
+                    Box::pin(
+                        self.persistence_manager
+                            .process_command(DeviceCommand::SetNctSalt(Some(salt.clone()))),
+                    )
+                    .await;
                     AppStateDispatchOutcome::Event("NctSaltStored")
                 }
             } else {
@@ -4704,9 +4746,11 @@ impl Client {
                 let old = snapshot.push_name.clone();
                 let outcome = if old != new_name {
                     debug!(target: "Client/AppState", "Persisting changed push name from app state mutation");
-                    self.persistence_manager
-                        .process_command(DeviceCommand::SetPushName(new_name.clone()))
-                        .await;
+                    Box::pin(
+                        self.persistence_manager
+                            .process_command(DeviceCommand::SetPushName(new_name.clone())),
+                    )
+                    .await;
                     bus.dispatch(Event::SelfPushNameUpdated(
                         crate::types::events::SelfPushNameUpdated::builder()
                             .from_server(true)
@@ -4717,7 +4761,7 @@ impl Client {
 
                     // WhatsApp Web sends presence immediately when receiving pushname
                     if old.is_empty() && !new_name.is_empty() {
-                        match self.send_automatic_available().await {
+                        match Box::pin(self.send_automatic_available()).await {
                             Ok(true) => {
                                 debug!(target: "Client/AppState", "Sent presence after receiving initial pushname from app state sync");
                             }
@@ -9416,3 +9460,7 @@ mod critical_bootstrap_tests {
 #[cfg(test)]
 #[path = "app_state/download_memory_tests.rs"]
 mod download_memory_tests;
+
+#[cfg(test)]
+#[path = "app_state/future_layout_tests.rs"]
+mod future_layout_tests;

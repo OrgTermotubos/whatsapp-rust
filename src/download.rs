@@ -1039,7 +1039,7 @@ impl Client {
         let capacity = limits.plaintext_capacity(download_capacity(downloadable) as u64) as usize;
         download_media_with_retry(
             client_refresh_budget(downloadable),
-            |force| self.prepare_requests(downloadable, force),
+            |force| Box::pin(self.prepare_requests(downloadable, force)),
             || async { self.invalidate_media_conn().await },
             |request| async move {
                 execute_request_into_memory(
@@ -1176,7 +1176,7 @@ impl Client {
             .await
     }
 
-    pub(crate) async fn download_with_memory_budget(
+    pub(crate) fn prepare_memory_download(
         &self,
         downloadable: &dyn Downloadable,
         memory: memory::MemoryBudget,
@@ -1184,7 +1184,17 @@ impl Client {
         if !self.http_client.supports_streaming() {
             return Err(DownloadPolicyError::StreamingRequired.into());
         }
-        let writer = MemoryWriter::bounded(downloadable.file_length().unwrap_or(0), memory)?;
+        Ok(MemoryWriter::bounded(
+            downloadable.file_length().unwrap_or(0),
+            memory,
+        )?)
+    }
+
+    pub(crate) async fn download_prepared_memory(
+        &self,
+        downloadable: &dyn Downloadable,
+        writer: MemoryWriter,
+    ) -> std::result::Result<MemoryWriter, ClientDownloadError> {
         self.download_to_writer_with_budget(
             downloadable,
             writer,
@@ -1206,7 +1216,7 @@ impl Client {
             client_refresh_budget(downloadable),
             &self.runtime,
             writer,
-            |force| self.prepare_requests(downloadable, force),
+            |force| Box::pin(self.prepare_requests(downloadable, force)),
             || async { self.invalidate_media_conn().await },
             |request, writer| async move {
                 streaming_download_and_decrypt(
