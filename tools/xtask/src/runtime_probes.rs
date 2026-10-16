@@ -2,7 +2,7 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
 use xtask_support::{capture, write, write_json};
 
 pub fn run(root: &Path, out_dir: &Path) -> Result<()> {
@@ -14,22 +14,24 @@ pub fn run(root: &Path, out_dir: &Path) -> Result<()> {
     }
     std::fs::create_dir_all(out_dir)?;
     eprintln!("building native runtime probe executables");
-    let build = capture(Command::new("cargo").current_dir(root).args([
-        "build",
-        "--locked",
-        "--profile",
-        "bench",
-        "-p",
-        "whatsapp-rust",
-        "--features",
-        "bench-harness,sqlite-storage-bundled",
-        "--example",
-        "runtime_latency",
-        "--example",
-        "runtime_footprint",
-        "--message-format=json-render-diagnostics",
-    ]))?;
-    write(&out_dir.join("build.stderr"), &build.stderr)?;
+    let build = capture_build(
+        Command::new("cargo").current_dir(root).args([
+            "build",
+            "--locked",
+            "--profile",
+            "bench",
+            "-p",
+            "whatsapp-rust",
+            "--features",
+            "bench-harness,sqlite-storage-bundled",
+            "--example",
+            "runtime_latency",
+            "--example",
+            "runtime_footprint",
+            "--message-format=json-render-diagnostics",
+        ]),
+        out_dir,
+    )?;
     let mut executables = BTreeMap::new();
     for line in build
         .stdout
@@ -132,4 +134,68 @@ pub fn run(root: &Path, out_dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn capture_build(command: &mut Command, out_dir: &Path) -> Result<Output> {
+    let output = command.output().context("building runtime probes")?;
+    write(&out_dir.join("build.stdout.jsonl"), &output.stdout)?;
+    write(&out_dir.join("build.stderr"), &output.stderr)?;
+    write_json(
+        &out_dir.join("build.status.json"),
+        &json!({
+            "success": output.status.success(),
+            "code": output.status.code(),
+        }),
+    )?;
+    ensure!(
+        output.status.success(),
+        "native probe build failed with {}; diagnostics saved in {}",
+        output.status,
+        out_dir.display(),
+    );
+    Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "subprocess fixture"]
+    fn compiler_error_child() {
+        println!(
+            r#"{{"reason":"compiler-message","message":{{"rendered":"synthetic compiler error"}}}}"#
+        );
+        eprintln!("synthetic cargo failure summary");
+        std::process::exit(23);
+    }
+
+    #[test]
+    fn failed_build_preserves_compiler_diagnostics_and_exit_status() {
+        let output = tempfile::tempdir().unwrap();
+        let error = capture_build(
+            Command::new(std::env::current_exe().unwrap()).args([
+                "--ignored",
+                "--exact",
+                "runtime_probes::tests::compiler_error_child",
+                "--nocapture",
+            ]),
+            output.path(),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("native probe build failed"),
+            "{error:#}"
+        );
+        let stdout = std::fs::read_to_string(output.path().join("build.stdout.jsonl")).unwrap();
+        let stderr = std::fs::read_to_string(output.path().join("build.stderr")).unwrap();
+        assert!(stdout.contains("synthetic compiler error"));
+        assert!(stderr.contains("synthetic cargo failure summary"));
+        let status: Value = serde_json::from_slice(
+            &std::fs::read(output.path().join("build.status.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["success"], false);
+        assert_eq!(status["code"], 23);
+    }
 }
