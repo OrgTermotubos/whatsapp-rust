@@ -34,7 +34,7 @@ jobs:
         run: cargo run --locked --quiet -p whatsapp-xtask -- ci runtime-probes --out-dir runtime-probe-results
       - name: Preserve samples and failure logs
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: native-runtime-probes-${{ github.sha }}
           path: runtime-probe-results
