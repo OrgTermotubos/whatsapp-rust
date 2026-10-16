@@ -36,6 +36,10 @@ pub(super) struct MemoryReservation {
 
 impl MemoryReservation {
     fn resize(&mut self, required: usize, preferred: usize) -> Result<usize, DownloadPolicyError> {
+        // These bytes already belong to this lease, regardless of other reservations.
+        if required <= self.bytes && preferred == self.bytes {
+            return Ok(self.bytes);
+        }
         let mut used = self
             .budget
             .0
@@ -120,15 +124,17 @@ impl MemoryWriter {
     pub(super) fn into_parts(mut self) -> (Vec<u8>, Option<MemoryReservation>) {
         if let Some(reservation) = &mut self.reservation {
             let actual = self.cursor.get_ref().capacity();
-            let mut used = reservation
-                .budget
-                .0
-                .used
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert!(actual <= reservation.bytes);
-            *used -= reservation.bytes - actual;
-            reservation.bytes = actual;
+            if actual < reservation.bytes {
+                let mut used = reservation
+                    .budget
+                    .0
+                    .used
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *used -= reservation.bytes - actual;
+                reservation.bytes = actual;
+            }
         }
         (self.cursor.into_inner(), self.reservation)
     }
@@ -326,6 +332,27 @@ mod tests {
             .filter(|success| *success)
             .count();
         assert_eq!(successes, 2);
+        assert_eq!(used(&budget), 0);
+    }
+
+    #[test]
+    fn writing_within_a_lease_does_not_wait_for_shared_accounting() {
+        let budget = MemoryBudget::new(32);
+        let mut writer = MemoryWriter::bounded(32, budget.clone()).unwrap();
+        let held = budget.0.used.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            writer.write_all(b"test").unwrap();
+            tx.send(writer.into_bytes()).unwrap();
+        });
+        let completed = rx.recv_timeout(std::time::Duration::from_secs(1));
+        drop(held);
+        worker.join().unwrap();
+        let bytes = completed.unwrap();
+        assert_eq!(bytes.as_ref(), b"test");
+        assert_eq!(used(&budget), 32);
+        assert!(MemoryWriter::bounded(1, budget.clone()).is_err());
+        drop(bytes);
         assert_eq!(used(&budget), 0);
     }
 }

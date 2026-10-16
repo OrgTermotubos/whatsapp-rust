@@ -1,5 +1,8 @@
 //! App-state collection sync and mutation dispatch.
 
+#[cfg(feature = "bench-harness")]
+pub(crate) mod prefetch_bench;
+
 use super::*;
 use crate::features::{AppStateError, AppStateResyncMode, AppStateResyncReport};
 use crate::request::DEFAULT_IQ_TIMEOUT;

@@ -399,6 +399,16 @@ name = "receive_footprint"
 test = false
 required-features = ["bench-harness"]
 
+[[example]]
+name = "runtime_latency"
+test = false
+required-features = ["bench-harness", "sqlite-storage"]
+
+[[example]]
+name = "runtime_footprint"
+test = false
+required-features = ["bench-harness", "sqlite-storage"]
+
 # Client-level group-send sweep. `required-features` keeps the fixture out of
 # an ordinary `cargo bench`/`cargo build --all-targets`, which would otherwise
 # fail to find `whatsapp_rust::bench_support`.
@@ -434,6 +444,11 @@ required-features = ["bench-harness", "sqlite-storage"]
 
 [[bench]]
 name = "client_dm_send"
+harness = false
+required-features = ["bench-harness"]
+
+[[bench]]
+name = "appstate_prefetch"
 harness = false
 required-features = ["bench-harness"]
 

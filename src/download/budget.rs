@@ -1,5 +1,6 @@
 //! Byte accounting for media readers and writers, independent of an HTTP runtime.
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Per-download application policy, independent of declared sizes and headers.
@@ -82,9 +83,14 @@ fn policy_io(error: DownloadPolicyError) -> io::Error {
 
 #[derive(Default)]
 struct State {
+    counters: Mutex<Counters>,
+    cancelled: AtomicBool,
+}
+
+#[derive(Default)]
+struct Counters {
     wire: u64,
     plaintext: u64,
-    cancelled: bool,
 }
 
 /// One operation's accounting, shared across readers, writers and retries.
@@ -96,14 +102,14 @@ struct State {
 #[derive(Clone)]
 pub(super) struct DownloadBudget {
     limits: DownloadLimits,
-    state: Option<Arc<Mutex<State>>>,
+    state: Option<Arc<State>>,
 }
 
 impl DownloadBudget {
     pub(super) fn cancellable(limits: DownloadLimits) -> Self {
         Self {
             limits,
-            state: Some(Arc::new(Mutex::new(State::default()))),
+            state: Some(Arc::new(State::default())),
         }
     }
 
@@ -114,31 +120,22 @@ impl DownloadBudget {
     pub(super) fn new(limits: DownloadLimits) -> Self {
         Self {
             limits,
-            state: limits
-                .is_bounded()
-                .then(|| Arc::new(Mutex::new(State::default()))),
+            state: limits.is_bounded().then(|| Arc::new(State::default())),
         }
     }
 
-    /// Cancel a bounded operation at its next I/O boundary. Unlimited budgets
-    /// have no shared state and do not support cancellation.
+    /// Cancel at the next I/O boundary when constructed with shared state.
     pub(super) fn cancel(&self) {
         let Some(state) = &self.state else {
             return;
         };
-        state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cancelled = true;
+        state.cancelled.store(true, Ordering::Release);
     }
 
     /// Check before starting other blocking I/O owned by this operation.
     pub(super) fn check_cancelled(&self) -> Result<(), DownloadPolicyError> {
         if let Some(state) = &self.state
-            && state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .cancelled
+            && state.cancelled.load(Ordering::Acquire)
         {
             return Err(DownloadPolicyError::Cancelled);
         }
@@ -160,27 +157,32 @@ impl DownloadBudget {
     }
 
     fn remaining(&self, domain: MediaByteDomain) -> io::Result<u64> {
+        self.check_cancelled().map_err(policy_io)?;
+        let Some((wire, plaintext)) = self.limits.bounds else {
+            return Ok(u64::MAX);
+        };
         let Some(state) = &self.state else {
             return Ok(u64::MAX);
         };
         let state = state
+            .counters
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.cancelled {
-            return Err(policy_io(DownloadPolicyError::Cancelled));
-        }
-        Ok(match (self.limits.bounds, domain) {
-            (Some((limit, _)), MediaByteDomain::Wire) => limit.saturating_sub(state.wire),
-            (Some((_, limit)), MediaByteDomain::Plaintext) => limit.saturating_sub(state.plaintext),
-            (None, _) => u64::MAX,
+        Ok(match domain {
+            MediaByteDomain::Wire => wire.saturating_sub(state.wire),
+            MediaByteDomain::Plaintext => plaintext.saturating_sub(state.plaintext),
         })
     }
 
     fn charge(&self, domain: MediaByteDomain, n: usize) {
+        if !self.limits.is_bounded() {
+            return;
+        }
         let Some(state) = &self.state else {
             return;
         };
         let mut state = state
+            .counters
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let count = match domain {
@@ -352,5 +354,33 @@ mod tests {
         let budget = DownloadBudget::new(DownloadLimits::new(19, 19));
         assert!(io::copy(&mut budget.reader(&mut source), &mut io::sink()).is_err());
         assert_eq!(source.0, 20);
+    }
+
+    #[test]
+    fn cancellation_only_io_does_not_wait_for_byte_accounting() {
+        let budget = DownloadBudget::cancellable(DownloadLimits::default());
+        let state = budget.state.as_ref().unwrap();
+        let held = state.counters.lock().unwrap();
+        let worker_budget = budget.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut bytes = [0; 4];
+            worker_budget
+                .reader(Cursor::new(b"test"))
+                .read_exact(&mut bytes)
+                .unwrap();
+            let mut sink = Vec::new();
+            worker_budget.writer(&mut sink).write_all(&bytes).unwrap();
+            tx.send(sink).unwrap();
+        });
+        let completed = rx.recv_timeout(std::time::Duration::from_secs(1));
+        drop(held);
+        worker.join().unwrap();
+        assert_eq!(completed.unwrap(), b"test");
+        budget.cancel();
+        assert_eq!(
+            policy(&budget.reader(io::empty()).read(&mut [0]).unwrap_err()),
+            DownloadPolicyError::Cancelled
+        );
     }
 }
