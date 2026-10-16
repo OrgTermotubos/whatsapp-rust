@@ -163,6 +163,9 @@ mod tests {
     #[test]
     #[ignore = "subprocess fixture"]
     fn compiler_error_child() {
+        if std::env::var_os("XTASK_COMPILER_FAILURE_FIXTURE").is_none() {
+            return;
+        }
         println!(
             r#"{{"reason":"compiler-message","message":{{"rendered":"synthetic compiler error"}}}}"#
         );
@@ -174,12 +177,14 @@ mod tests {
     fn failed_build_preserves_compiler_diagnostics_and_exit_status() {
         let output = tempfile::tempdir().unwrap();
         let error = capture_build(
-            Command::new(std::env::current_exe().unwrap()).args([
-                "--ignored",
-                "--exact",
-                "runtime_probes::tests::compiler_error_child",
-                "--nocapture",
-            ]),
+            Command::new(std::env::current_exe().unwrap())
+                .env("XTASK_COMPILER_FAILURE_FIXTURE", "1")
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "runtime_probes::tests::compiler_error_child",
+                    "--nocapture",
+                ]),
             output.path(),
         )
         .unwrap_err();
