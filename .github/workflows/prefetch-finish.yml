@@ -1,4 +1,4 @@
-name: Caller allocation prefetch versus pinned unbounded reference
+name: Final SDK prefetch versus aligned unbounded reference
 on:
   push:
     branches: [agent/prefetch-caller-allocation]
@@ -17,7 +17,7 @@ env:
   MALLOC_TOP_PAD_: "131072"
 jobs:
   native:
-    name: Three paired caller-allocation versus unbounded native repetitions
+    name: Three paired final SDK versus aligned unbounded repetitions
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -40,13 +40,17 @@ jobs:
         run: |
           rustc -Vv
           lscpu
+          # Refuse to compare different dependency inputs or payload fixtures.
+          test "$(git rev-parse 7c691e9acdbaf026a4feff61b2514a96f1c1490c:Cargo.lock)" = "$(git rev-parse eb2114ff7cb3a5ad409fdeebf4ee70b9c09fd98a:Cargo.lock)"
+          test "$(git rev-parse 7c691e9acdbaf026a4feff61b2514a96f1c1490c:src/client/app_state/prefetch_bench.rs)" = "$(git rev-parse eb2114ff7cb3a5ad409fdeebf4ee70b9c09fd98a:src/client/app_state/prefetch_bench.rs)"
       - name: Build pair 1 reference independently
         run: |
-          git reset --hard f56a47f43d1ff5a5af1f1766a99c8ca987535129
+          git reset --hard eb2114ff7cb3a5ad409fdeebf4ee70b9c09fd98a
           git rev-parse HEAD
           sed -i -E 's/^fn (four_external_blobs|eight_clients|streaming_vec|streaming_accounted)\(/fn pair1_reference_\1(/' benches/appstate_prefetch.rs
           sha256sum Cargo.lock src/client/app_state/prefetch_bench.rs
           cargo codspeed build -m walltime -p whatsapp-rust --features bench-harness --bench appstate_prefetch
+          git diff --exit-code -- src wacore Cargo.lock
           # Attribute this experiment to its workflow head, not the source PR check.
           git reset --hard "$GITHUB_SHA"
       - name: Measure pair 1 reference fresh process
@@ -57,11 +61,12 @@ jobs:
           run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
       - name: Build pair 1 candidate independently
         run: |
-          git reset --hard ead6f93a04211889bffc067bfad49bd55136864f
+          git reset --hard 7c691e9acdbaf026a4feff61b2514a96f1c1490c
           git rev-parse HEAD
           sed -i -E 's/^fn (four_external_blobs|eight_clients|streaming_vec|streaming_accounted)\(/fn pair1_candidate_\1(/' benches/appstate_prefetch.rs
           sha256sum Cargo.lock src/client/app_state/prefetch_bench.rs
           cargo codspeed build -m walltime -p whatsapp-rust --features bench-harness --bench appstate_prefetch
+          git diff --exit-code -- src wacore Cargo.lock
           # Attribute this experiment to its workflow head, not the source PR check.
           git reset --hard "$GITHUB_SHA"
       - name: Measure pair 1 candidate fresh process
@@ -72,11 +77,12 @@ jobs:
           run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
       - name: Build pair 2 candidate independently
         run: |
-          git reset --hard ead6f93a04211889bffc067bfad49bd55136864f
+          git reset --hard 7c691e9acdbaf026a4feff61b2514a96f1c1490c
           git rev-parse HEAD
           sed -i -E 's/^fn (four_external_blobs|eight_clients|streaming_vec|streaming_accounted)\(/fn pair2_candidate_\1(/' benches/appstate_prefetch.rs
           sha256sum Cargo.lock src/client/app_state/prefetch_bench.rs
           cargo codspeed build -m walltime -p whatsapp-rust --features bench-harness --bench appstate_prefetch
+          git diff --exit-code -- src wacore Cargo.lock
           # Attribute this experiment to its workflow head, not the source PR check.
           git reset --hard "$GITHUB_SHA"
       - name: Measure pair 2 candidate fresh process
@@ -87,11 +93,12 @@ jobs:
           run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
       - name: Build pair 2 reference independently
         run: |
-          git reset --hard f56a47f43d1ff5a5af1f1766a99c8ca987535129
+          git reset --hard eb2114ff7cb3a5ad409fdeebf4ee70b9c09fd98a
           git rev-parse HEAD
           sed -i -E 's/^fn (four_external_blobs|eight_clients|streaming_vec|streaming_accounted)\(/fn pair2_reference_\1(/' benches/appstate_prefetch.rs
           sha256sum Cargo.lock src/client/app_state/prefetch_bench.rs
           cargo codspeed build -m walltime -p whatsapp-rust --features bench-harness --bench appstate_prefetch
+          git diff --exit-code -- src wacore Cargo.lock
           # Attribute this experiment to its workflow head, not the source PR check.
           git reset --hard "$GITHUB_SHA"
       - name: Measure pair 2 reference fresh process
@@ -102,11 +109,12 @@ jobs:
           run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
       - name: Build pair 3 reference independently
         run: |
-          git reset --hard f56a47f43d1ff5a5af1f1766a99c8ca987535129
+          git reset --hard eb2114ff7cb3a5ad409fdeebf4ee70b9c09fd98a
           git rev-parse HEAD
           sed -i -E 's/^fn (four_external_blobs|eight_clients|streaming_vec|streaming_accounted)\(/fn pair3_reference_\1(/' benches/appstate_prefetch.rs
           sha256sum Cargo.lock src/client/app_state/prefetch_bench.rs
           cargo codspeed build -m walltime -p whatsapp-rust --features bench-harness --bench appstate_prefetch
+          git diff --exit-code -- src wacore Cargo.lock
           # Attribute this experiment to its workflow head, not the source PR check.
           git reset --hard "$GITHUB_SHA"
       - name: Measure pair 3 reference fresh process
@@ -117,11 +125,12 @@ jobs:
           run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
       - name: Build pair 3 candidate independently
         run: |
-          git reset --hard ead6f93a04211889bffc067bfad49bd55136864f
+          git reset --hard 7c691e9acdbaf026a4feff61b2514a96f1c1490c
           git rev-parse HEAD
           sed -i -E 's/^fn (four_external_blobs|eight_clients|streaming_vec|streaming_accounted)\(/fn pair3_candidate_\1(/' benches/appstate_prefetch.rs
           sha256sum Cargo.lock src/client/app_state/prefetch_bench.rs
           cargo codspeed build -m walltime -p whatsapp-rust --features bench-harness --bench appstate_prefetch
+          git diff --exit-code -- src wacore Cargo.lock
           # Attribute this experiment to its workflow head, not the source PR check.
           git reset --hard "$GITHUB_SHA"
       - name: Measure pair 3 candidate fresh process
