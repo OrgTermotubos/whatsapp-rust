@@ -24,7 +24,7 @@ jobs:
   prefetch:
     name: Prefetch (${{ matrix.mode }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -52,6 +52,32 @@ jobs:
           git rev-parse HEAD
           rustc -Vv
           lscpu
+      # Measure the pinned mutex implementation on the same machine, before
+      # compiling the candidate. CodSpeed reads each checkout's actual HEAD.
+      - uses: actions/checkout@v7
+        if: matrix.mode == 'walltime'
+        with:
+          ref: a2f6bd940cb88bcc4e70f056aad34c5172ec8db8
+          path: .prefetch-baseline
+          persist-credentials: false
+      - name: Build the pinned walltime reference
+        if: matrix.mode == 'walltime'
+        working-directory: .prefetch-baseline
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          git rev-parse HEAD
+          cargo codspeed build -m walltime -p whatsapp-rust --features bench-harness --bench appstate_prefetch
+      - name: Measure the pinned walltime reference
+        if: matrix.mode == 'walltime'
+        uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        with:
+          mode: walltime
+          runner-version: "5.4.2"
+          working-directory: .prefetch-baseline
+          run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
       - name: Build prefetch benchmark
         env:
           BUILD_MODES: ${{ matrix.build }}
