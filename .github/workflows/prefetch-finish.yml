@@ -41,8 +41,8 @@ jobs:
           rustc -Vv
           lscpu
           # Refuse to compare different dependency inputs or payload fixtures.
-          test "$(git rev-parse 7c691e9acdbaf026a4feff61b2514a96f1c1490c:Cargo.lock)" = "$(git rev-parse eb2114ff7cb3a5ad409fdeebf4ee70b9c09fd98a:Cargo.lock)"
-          test "$(git rev-parse 7c691e9acdbaf026a4feff61b2514a96f1c1490c:src/client/app_state/prefetch_bench.rs)" = "$(git rev-parse eb2114ff7cb3a5ad409fdeebf4ee70b9c09fd98a:src/client/app_state/prefetch_bench.rs)"
+          test "$(git rev-parse a85d3d807f16e5ffab48217e3d11a5fdd8876e84:Cargo.lock)" = "$(git rev-parse eb2114ff7cb3a5ad409fdeebf4ee70b9c09fd98a:Cargo.lock)"
+          test "$(git rev-parse a85d3d807f16e5ffab48217e3d11a5fdd8876e84:src/client/app_state/prefetch_bench.rs)" = "$(git rev-parse eb2114ff7cb3a5ad409fdeebf4ee70b9c09fd98a:src/client/app_state/prefetch_bench.rs)"
       - name: Build pair 1 reference independently
         run: |
           git reset --hard eb2114ff7cb3a5ad409fdeebf4ee70b9c09fd98a
@@ -61,7 +61,7 @@ jobs:
           run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
       - name: Build pair 1 candidate independently
         run: |
-          git reset --hard 7c691e9acdbaf026a4feff61b2514a96f1c1490c
+          git reset --hard a85d3d807f16e5ffab48217e3d11a5fdd8876e84
           git rev-parse HEAD
           sed -i -E 's/^fn (four_external_blobs|eight_clients|streaming_vec|streaming_accounted)\(/fn pair1_candidate_\1(/' benches/appstate_prefetch.rs
           sha256sum Cargo.lock src/client/app_state/prefetch_bench.rs
@@ -77,7 +77,7 @@ jobs:
           run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
       - name: Build pair 2 candidate independently
         run: |
-          git reset --hard 7c691e9acdbaf026a4feff61b2514a96f1c1490c
+          git reset --hard a85d3d807f16e5ffab48217e3d11a5fdd8876e84
           git rev-parse HEAD
           sed -i -E 's/^fn (four_external_blobs|eight_clients|streaming_vec|streaming_accounted)\(/fn pair2_candidate_\1(/' benches/appstate_prefetch.rs
           sha256sum Cargo.lock src/client/app_state/prefetch_bench.rs
@@ -125,7 +125,7 @@ jobs:
           run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
       - name: Build pair 3 candidate independently
         run: |
-          git reset --hard 7c691e9acdbaf026a4feff61b2514a96f1c1490c
+          git reset --hard a85d3d807f16e5ffab48217e3d11a5fdd8876e84
           git rev-parse HEAD
           sed -i -E 's/^fn (four_external_blobs|eight_clients|streaming_vec|streaming_accounted)\(/fn pair3_candidate_\1(/' benches/appstate_prefetch.rs
           sha256sum Cargo.lock src/client/app_state/prefetch_bench.rs
