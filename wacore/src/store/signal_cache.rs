@@ -760,7 +760,7 @@ mod session_flush_buffer_tests {
     #[tokio::test]
     async fn capture_reuses_buffer_and_preserves_persisted_encoding() {
         let cache = SignalStoreCache::new();
-        let address = crate::libsignal::protocol::ProtocolAddress::new("pool-test", 1.into());
+        let address = ProtocolAddress::new("pool-test", 1.into());
         cache
             .put_session(&address, SessionRecord::new_fresh())
             .await;
