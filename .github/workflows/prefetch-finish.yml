@@ -1,0 +1,116 @@
+name: Prefetch finish lifetime experiment
+
+on:
+  push:
+    branches: [agent/prefetch-finish-lifetime]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: prefetch-finish-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  MALLOC_ARENA_MAX: "1"
+  MALLOC_MMAP_THRESHOLD_: "131072"
+  MALLOC_TRIM_THRESHOLD_: "131072"
+  MALLOC_TOP_PAD_: "131072"
+
+jobs:
+  guards:
+    name: Preserve download policy and allocation guards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@3.25.3
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: prefetch-finish-guards
+          cache-targets: "false"
+      - name: Preserve prefetch first-poll allocation and admission behavior
+        run: cargo test -p whatsapp-rust --lib client::app_state::
+      - name: Preserve download hashes, cancellation, retries and lease lifetime
+        run: cargo test -p whatsapp-rust --lib download::
+
+  prefetch:
+    needs: guards
+    name: Prefetch (${{ matrix.mode }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: walltime
+            build: -m walltime
+          - mode: simulation,memory
+            build: -m simulation -m memory
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@3.25.3,cargo-codspeed@5.0.2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: prefetch-performance-${{ matrix.mode }}
+          cache-targets: "true"
+          cache-workspace-crates: "true"
+      - name: Record source and host
+        run: |
+          git rev-parse HEAD
+          rustc -Vv
+          lscpu
+      # CodSpeed groups uploads from this workflow run. Distinct benchmark
+      # names keep each pinned production implementation separate in that run.
+      # Compare caller-side buffer ownership conversion with the unchanged worker-side reference.
+      - name: Build prefetch benchmark
+        env:
+          BUILD_MODES: ${{ matrix.build }}
+        run: |
+          git rev-parse HEAD
+          cargo codspeed build $BUILD_MODES -p whatsapp-rust --features bench-harness --bench appstate_prefetch
+      - name: Measure prefetch
+        uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369
+        with:
+          mode: ${{ matrix.mode }}
+          runner-version: "5.4.2"
+          run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
+      - name: Build the pinned worker-finish reference
+        env:
+          BUILD_MODES: ${{ matrix.build }}
+        run: |
+          git reset --hard f47c529ce84eaf62a6636f28d339c3fcb175f4e1
+          git rev-parse HEAD
+          sed -i -E 's/^fn (four_external_blobs|eight_clients|streaming_vec|streaming_accounted)\(/fn reference_\1(/' benches/appstate_prefetch.rs
+          git diff -- benches/appstate_prefetch.rs
+          sha256sum Cargo.lock src/client/app_state/prefetch_bench.rs
+          cargo codspeed build $BUILD_MODES -p whatsapp-rust --features bench-harness --bench appstate_prefetch
+      - name: Measure the pinned worker-finish reference
+        uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369
+        with:
+          mode: ${{ matrix.mode }}
+          runner-version: "5.4.2"
+          run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
+      - name: Restore candidate source
+        if: always()
+        run: git reset --hard "$GITHUB_SHA"
