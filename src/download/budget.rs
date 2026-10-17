@@ -142,17 +142,17 @@ impl DownloadBudget {
         Ok(())
     }
 
-    pub(super) fn reader<R: Read>(&self, inner: R) -> impl Read + use<R> {
+    pub(super) fn reader<R: Read>(&self, inner: R) -> impl Read + use<'_, R> {
         BudgetReader {
             inner,
-            budget: self.clone(),
+            budget: self,
         }
     }
 
-    pub(super) fn writer<W: Write>(&self, inner: W) -> impl Write + use<W> {
+    pub(super) fn writer<W: Write>(&self, inner: W) -> impl Write + use<'_, W> {
         BudgetWriter {
             inner,
-            budget: self.clone(),
+            budget: self,
         }
     }
 
@@ -204,12 +204,12 @@ impl DownloadBudget {
     }
 }
 
-struct BudgetReader<R> {
+struct BudgetReader<'a, R> {
     inner: R,
-    budget: DownloadBudget,
+    budget: &'a DownloadBudget,
 }
 
-impl<R: Read> Read for BudgetReader<R> {
+impl<R: Read> Read for BudgetReader<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -234,12 +234,12 @@ impl<R: Read> Read for BudgetReader<R> {
     }
 }
 
-struct BudgetWriter<W> {
+struct BudgetWriter<'a, W> {
     inner: W,
-    budget: DownloadBudget,
+    budget: &'a DownloadBudget,
 }
 
-impl<W: Write> Write for BudgetWriter<W> {
+impl<W: Write> Write for BudgetWriter<'_, W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let remaining = self.budget.remaining(MediaByteDomain::Plaintext)?;
         if buf.len() as u64 > remaining {
@@ -297,7 +297,8 @@ mod tests {
             .reader(Cursor::new(b"ab"))
             .read_exact(&mut [0; 2])
             .unwrap();
-        let mut retry = budget.clone().reader(Cursor::new(b"cde"));
+        let retry_budget = budget.clone();
+        let mut retry = retry_budget.reader(Cursor::new(b"cde"));
         retry.read_exact(&mut [0; 2]).unwrap();
         assert!(matches!(
             policy(&retry.read(&mut [0]).unwrap_err()),

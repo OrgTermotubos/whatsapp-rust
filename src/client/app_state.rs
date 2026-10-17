@@ -921,9 +921,9 @@ impl Client {
         })
     }
 
-    fn external_blob_job(
-        &self,
-        ext: wa::ExternalBlobReference,
+    fn external_blob_job<'a>(
+        &'a self,
+        ext: &'a wa::ExternalBlobReference,
         kind: BlobKind,
     ) -> impl Future<
         Output = (
@@ -931,17 +931,15 @@ impl Client {
             BlobKind,
             std::result::Result<bytes::Bytes, crate::download::ClientDownloadError>,
         ),
-    > + '_ {
+    > + 'a {
         let prepared = self
-            .prepare_memory_download(&ext, self.cache_config.app_state_downloads.budget().clone());
+            .prepare_memory_download(ext, self.cache_config.app_state_downloads.budget().clone());
         async move {
             let result = match prepared {
-                Ok(writer) => Box::pin(self.download_prepared_memory(&ext, writer))
-                    .await
-                    .map(crate::download::memory::MemoryWriter::into_bytes),
+                Ok(writer) => Box::pin(self.download_prepared_memory(ext, writer)).await,
                 Err(error) => Err(error),
             };
-            (ext.direct_path, kind, result)
+            (ext.direct_path.clone(), kind, result)
         }
     }
 
@@ -955,18 +953,16 @@ impl Client {
     ) -> PrefetchedBlobs {
         use futures::StreamExt;
 
-        // Clone the (small) blob ref into each job so the task owns its input and
-        // captures only `&self` (keeps the future Send); the directPath is
-        // recovered from the moved `ext` after the fetch. Dedup by directPath so
-        // patches sharing a blob don't fetch it twice into the same map key.
-        let mut jobs: Vec<(wa::ExternalBlobReference, BlobKind)> = Vec::new();
+        // Patch lists outlive all jobs, so metadata need not be cloned before
+        // admission. Shared paths still produce a single retained allocation.
+        let mut jobs = Vec::new();
         let mut seen_paths: HashSet<&str> = HashSet::new();
         for pl in patch_lists {
             if let Some(ext) = &pl.snapshot_ref
                 && let Some(path) = ext.direct_path.as_deref()
                 && seen_paths.insert(path)
             {
-                jobs.push((ext.clone(), BlobKind::Snapshot(pl.name)));
+                jobs.push((ext, BlobKind::Snapshot(pl.name)));
             }
             for patch in &pl.patches {
                 if let Some(ext) = patch.external_mutations.as_option()
@@ -978,7 +974,7 @@ impl Client {
                         .as_option()
                         .and_then(|v| v.version)
                         .unwrap_or(0);
-                    jobs.push((ext.clone(), BlobKind::Mutation(v)));
+                    jobs.push((ext, BlobKind::Mutation(v)));
                 }
             }
         }
@@ -989,14 +985,18 @@ impl Client {
 
         let policy = &self.cache_config.app_state_downloads;
         let mut pre_downloaded = HashMap::with_capacity(jobs.len());
-        // Refused references never allocate a download coroutine.
-        let results = futures::stream::iter(
-            jobs.into_iter()
-                .map(|(ext, kind)| self.external_blob_job(ext, kind)),
-        )
-        .buffer_unordered(policy.config.concurrency().get());
-        futures::pin_mut!(results);
-        while let Some((path, kind, result)) = results.next().await {
+        let mut jobs = jobs.into_iter();
+        let mut in_flight = futures::stream::FuturesUnordered::new();
+        loop {
+            while in_flight.len() < policy.config.concurrency().get() {
+                let Some((ext, kind)) = jobs.next() else {
+                    break;
+                };
+                in_flight.push(self.external_blob_job(ext, kind));
+            }
+            let Some((path, kind, result)) = in_flight.next().await else {
+                break;
+            };
             match &result {
                 Ok(bytes) => match kind {
                     BlobKind::Mutation(version) => {

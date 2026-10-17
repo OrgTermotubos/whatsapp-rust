@@ -5,6 +5,7 @@ use crate::http::{
 };
 use crate::mediaconn::{MEDIA_AUTH_REFRESH_RETRY_ATTEMPTS, MediaConn, is_media_auth_error};
 use anyhow::{Result, anyhow};
+use smallvec::SmallVec;
 use std::sync::Arc;
 use wacore::runtime::Runtime;
 use wacore::sync_marker::MaybeSend;
@@ -132,24 +133,47 @@ impl Downloadable for DownloadParams {
 
 /// Keep integrity metadata beside the public request, without changing the
 /// fields consumers construct or match in MediaDecryption / DownloadRequest.
+/// Valid hashes fit inline; malformed lengths remain intact for validation.
+/// One pointer keeps retry futures from embedding the digest pair in each phase.
 #[derive(Default)]
 struct ExpectedMediaHashes {
     budget: Option<DownloadBudget>,
-    encrypted: Option<Vec<u8>>,
-    plaintext: Option<Vec<u8>>,
+    integrity: Option<Box<MediaIntegrityHashes>>,
+}
+
+struct MediaIntegrityHashes {
+    encrypted: Option<SmallVec<[u8; 32]>>,
+    plaintext: Option<SmallVec<[u8; 32]>>,
 }
 
 impl ExpectedMediaHashes {
     fn from_downloadable(downloadable: &dyn Downloadable) -> Self {
         if downloadable.is_encrypted() {
+            let integrity = MediaIntegrityHashes {
+                encrypted: downloadable.file_enc_sha256().map(SmallVec::from_slice),
+                plaintext: downloadable.file_sha256().map(SmallVec::from_slice),
+            };
+            let integrity = (integrity.encrypted.is_some() || integrity.plaintext.is_some())
+                .then(|| Box::new(integrity));
             Self {
                 budget: None,
-                encrypted: downloadable.file_enc_sha256().map(<[u8]>::to_vec),
-                plaintext: downloadable.file_sha256().map(<[u8]>::to_vec),
+                integrity,
             }
         } else {
             Self::default()
         }
+    }
+
+    fn encrypted(&self) -> Option<&[u8]> {
+        self.integrity
+            .as_ref()
+            .and_then(|hashes| hashes.encrypted.as_deref())
+    }
+
+    fn plaintext(&self) -> Option<&[u8]> {
+        self.integrity
+            .as_ref()
+            .and_then(|hashes| hashes.plaintext.as_deref())
     }
 }
 
@@ -605,8 +629,8 @@ fn decrypt_or_validate_buffered_body(
             body,
             media_key,
             *media_type,
-            hashes.encrypted.as_deref(),
-            hashes.plaintext.as_deref(),
+            hashes.encrypted(),
+            hashes.plaintext(),
         )
         .map_err(DownloadRequestError::other),
         MediaDecryption::Plaintext { file_sha256 } => {
@@ -696,8 +720,33 @@ where
     }
 }
 
+enum WriterAttempt<W, T> {
+    Verified(T),
+    Failed(W, DownloadRequestError),
+}
+
+impl<W> From<(W, std::result::Result<(), DownloadRequestError>)> for WriterAttempt<W, W> {
+    fn from((writer, result): (W, std::result::Result<(), DownloadRequestError>)) -> Self {
+        match result {
+            Ok(()) => Self::Verified(writer),
+            Err(error) => Self::Failed(writer, error),
+        }
+    }
+}
+
+impl<W> WriterAttempt<W, W> {
+    fn into_parts(self) -> (W, std::result::Result<(), DownloadRequestError>) {
+        match self {
+            Self::Verified(writer) => (writer, Ok(())),
+            Self::Failed(writer, error) => (writer, Err(error)),
+        }
+    }
+}
+
 async fn download_to_writer_with_retry<
     W,
+    T,
+    Attempt,
     PrepareRequests,
     PrepareRequestsFut,
     InvalidateMediaConn,
@@ -711,7 +760,7 @@ async fn download_to_writer_with_retry<
     mut prepare_requests: PrepareRequests,
     mut invalidate_media_conn: InvalidateMediaConn,
     mut execute_request: ExecuteRequest,
-) -> std::result::Result<W, DownloadRequestError>
+) -> std::result::Result<T, DownloadRequestError>
 where
     W: DownloadWriter + MaybeSend + 'static,
     PrepareRequests: FnMut(bool) -> PrepareRequestsFut,
@@ -721,7 +770,8 @@ where
     InvalidateMediaConn: FnMut() -> InvalidateMediaConnFut,
     InvalidateMediaConnFut: Future<Output = ()>,
     ExecuteRequest: FnMut(wacore::download::DownloadRequest, W) -> ExecuteRequestFut,
-    ExecuteRequestFut: Future<Output = Result<(W, std::result::Result<(), DownloadRequestError>)>>,
+    ExecuteRequestFut: Future<Output = Result<Attempt>>,
+    Attempt: Into<WriterAttempt<W, T>>,
 {
     let mut force_refresh = false;
     let mut last_err: Option<anyhow::Error> = None;
@@ -741,33 +791,33 @@ where
         let mut retry_with_fresh_route = false;
 
         for request in requests {
-            let (next_writer, result) = match execute_request(request.clone(), writer).await {
-                Ok(outcome) => outcome,
+            let (next_writer, error) = match execute_request(request.clone(), writer).await {
+                Ok(outcome) => match outcome.into() {
+                    WriterAttempt::Verified(output) => return Ok(output),
+                    WriterAttempt::Failed(writer, error) => (writer, error),
+                },
                 // The writer went into the failed executor and did not come back,
                 // so there is nothing left here to clean up.
                 Err(err) => return Err(DownloadRequestError::Other(err)),
             };
             writer = next_writer;
 
-            match result {
-                Ok(()) => return Ok(writer),
-                Err(
-                    err @ (DownloadRequestError::WriterIo(_)
-                    | DownloadRequestError::ResourcePolicy(_)),
-                ) => {
+            match error {
+                err @ (DownloadRequestError::WriterIo(_)
+                | DownloadRequestError::ResourcePolicy(_)) => {
                     return Err(discard_failed_write(runtime, writer, err).await);
                 }
-                Err(err) if err.should_refresh_route() && attempt < max_refresh_attempts => {
+                err if err.should_refresh_route() && attempt < max_refresh_attempts => {
                     last_rejection = Some(err.into_anyhow());
                     invalidate_media_conn().await;
                     force_refresh = true;
                     retry_with_fresh_route = true;
                     break;
                 }
-                Err(err) if err.is_auth() || err.is_not_found() => {
+                err if err.is_auth() || err.is_not_found() => {
                     return Err(discard_failed_write(runtime, writer, err).await);
                 }
-                Err(err) => {
+                err => {
                     let err = err.into_anyhow();
                     log_download_retry(&request, &err);
                     last_err = Some(err);
@@ -1172,7 +1222,7 @@ impl Client {
             .into());
         }
         let budget = limits.is_bounded().then(|| DownloadBudget::new(limits));
-        self.download_to_writer_with_budget(downloadable, writer, budget)
+        self.download_to_writer_with_budget(downloadable, writer, budget, std::convert::identity)
             .await
     }
 
@@ -1194,21 +1244,28 @@ impl Client {
         &self,
         downloadable: &dyn Downloadable,
         writer: MemoryWriter,
-    ) -> std::result::Result<MemoryWriter, ClientDownloadError> {
+    ) -> std::result::Result<bytes::Bytes, ClientDownloadError> {
         self.download_to_writer_with_budget(
             downloadable,
             writer,
             Some(DownloadBudget::cancellable(DownloadLimits::default())),
+            MemoryWriter::into_bytes,
         )
         .await
     }
 
-    async fn download_to_writer_with_budget<W: DownloadWriter + MaybeSend + 'static>(
+    async fn download_to_writer_with_budget<W, T, Finish>(
         &self,
         downloadable: &dyn Downloadable,
         writer: W,
         budget: Option<DownloadBudget>,
-    ) -> std::result::Result<W, ClientDownloadError> {
+        finish: Finish,
+    ) -> std::result::Result<T, ClientDownloadError>
+    where
+        W: DownloadWriter + MaybeSend + 'static,
+        T: MaybeSend + 'static,
+        Finish: Fn(W) -> T + MaybeSend + Copy + 'static,
+    {
         let _cancel = CancelDownloadOnDrop(budget.clone());
         let budget = &budget;
 
@@ -1219,7 +1276,7 @@ impl Client {
             |force| Box::pin(self.prepare_requests(downloadable, force)),
             || async { self.invalidate_media_conn().await },
             |request, writer| async move {
-                streaming_download_and_decrypt(
+                streaming_download_and_decrypt_mapped(
                     &self.http_client,
                     &self.runtime,
                     &request,
@@ -1228,6 +1285,7 @@ impl Client {
                         ..ExpectedMediaHashes::from_downloadable(downloadable)
                     },
                     writer,
+                    finish,
                 )
                 .await
             },
@@ -1324,16 +1382,47 @@ async fn streaming_download_and_decrypt<W: DownloadWriter + MaybeSend + 'static>
     hashes: ExpectedMediaHashes,
     writer: W,
 ) -> Result<(W, std::result::Result<(), DownloadRequestError>)> {
+    streaming_download_and_decrypt_mapped(
+        http_client,
+        runtime,
+        request,
+        hashes,
+        writer,
+        std::convert::identity,
+    )
+    .await
+    .map(WriterAttempt::into_parts)
+}
+
+async fn streaming_download_and_decrypt_mapped<W, T, Finish>(
+    http_client: &Arc<dyn HttpClient>,
+    runtime: &Arc<dyn Runtime>,
+    request: &wacore::download::DownloadRequest,
+    hashes: ExpectedMediaHashes,
+    writer: W,
+    finish: Finish,
+) -> Result<WriterAttempt<W, T>>
+where
+    W: DownloadWriter + MaybeSend + 'static,
+    T: MaybeSend + 'static,
+    Finish: FnOnce(W) -> T + MaybeSend + 'static,
+{
     if !http_client.supports_streaming() {
         if hashes.budget.is_some() {
-            return Ok((
+            return Ok(WriterAttempt::Failed(
                 writer,
-                Err(DownloadRequestError::ResourcePolicy(
-                    DownloadPolicyError::StreamingRequired,
-                )),
+                DownloadRequestError::ResourcePolicy(DownloadPolicyError::StreamingRequired),
             ));
         }
-        return buffered_download_and_decrypt(http_client, runtime, request, hashes, writer).await;
+        return buffered_download_and_decrypt(
+            http_client,
+            runtime,
+            request,
+            hashes,
+            writer,
+            finish,
+        )
+        .await;
     }
 
     let http_client = http_client.clone();
@@ -1387,8 +1476,8 @@ async fn streaming_download_and_decrypt<W: DownloadWriter + MaybeSend + 'static>
                         reader,
                         media_key,
                         *media_type,
-                        hashes.encrypted.as_deref(),
-                        hashes.plaintext.as_deref(),
+                        hashes.encrypted(),
+                        hashes.plaintext(),
                         &mut limited_writer,
                     )
                     .map_err(DownloadRequestError::streamed)?;
@@ -1409,22 +1498,31 @@ async fn streaming_download_and_decrypt<W: DownloadWriter + MaybeSend + 'static>
             finish_verified_write(&mut writer)
         })();
 
-        (writer, result)
+        match result {
+            Ok(()) => WriterAttempt::Verified(finish(writer)),
+            Err(error) => WriterAttempt::Failed(writer, error),
+        }
     })
     .await)
 }
 
 /// Buffered fallback when streaming is not available.
-async fn buffered_download_and_decrypt<W: DownloadWriter + MaybeSend + 'static>(
+async fn buffered_download_and_decrypt<W, T, Finish>(
     http_client: &Arc<dyn HttpClient>,
     runtime: &Arc<dyn Runtime>,
     request: &wacore::download::DownloadRequest,
     hashes: ExpectedMediaHashes,
     writer: W,
-) -> Result<(W, std::result::Result<(), DownloadRequestError>)> {
+    finish: Finish,
+) -> Result<WriterAttempt<W, T>>
+where
+    W: DownloadWriter + MaybeSend + 'static,
+    T: MaybeSend + 'static,
+    Finish: FnOnce(W) -> T + MaybeSend + 'static,
+{
     let mut body = match buffered_download_body(http_client, request).await {
         Ok(body) => body,
-        Err(err) => return Ok((writer, Err(err))),
+        Err(err) => return Ok(WriterAttempt::Failed(writer, err)),
     };
     let decryption = request.decryption.clone();
 
@@ -1441,7 +1539,10 @@ async fn buffered_download_and_decrypt<W: DownloadWriter + MaybeSend + 'static>(
             finish_verified_write(&mut writer)
         })();
 
-        (writer, result)
+        match result {
+            Ok(()) => WriterAttempt::Verified(finish(writer)),
+            Err(error) => WriterAttempt::Failed(writer, error),
+        }
     })
     .await)
 }
@@ -2190,8 +2291,10 @@ mod tests {
             },
             &ExpectedMediaHashes {
                 budget: None,
-                encrypted: Some(enc.file_enc_sha256.to_vec()),
-                plaintext: Some(enc.file_sha256.to_vec()),
+                integrity: Some(Box::new(MediaIntegrityHashes {
+                    encrypted: Some(SmallVec::from_slice(&enc.file_enc_sha256)),
+                    plaintext: Some(SmallVec::from_slice(&enc.file_sha256)),
+                })),
             },
         )
         .expect("decryption should succeed");
@@ -3000,6 +3103,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mapped_download_finalizes_only_verified_output_on_the_worker() {
+        #[derive(Clone, Copy)]
+        enum Case {
+            Valid,
+            BadMac,
+            BadEncryptedHash,
+            BadPlaintextHash,
+        }
+
+        let caller = std::thread::current().id();
+        for streaming in [false, true] {
+            for case in [
+                Case::Valid,
+                Case::BadMac,
+                Case::BadEncryptedHash,
+                Case::BadPlaintextHash,
+            ] {
+                let plaintext = vec![0x59; 20_000];
+                let (mut params, mut body) = encrypted_params(&plaintext);
+                match case {
+                    Case::Valid => {}
+                    Case::BadMac => body[8192] ^= 1,
+                    Case::BadEncryptedHash => params.file_enc_sha256.as_mut().unwrap()[0] ^= 1,
+                    Case::BadPlaintextHash => params.file_sha256[0] ^= 1,
+                }
+                let request =
+                    DownloadUtils::prepare_download_requests(&params, &MediaRoute::default_hosts())
+                        .unwrap()
+                        .remove(0);
+                let http: Arc<dyn HttpClient> = if streaming {
+                    RoutedHttpClient::streaming(Vec::new(), (200, body))
+                } else {
+                    RoutedHttpClient::new(Vec::new(), (200, body))
+                };
+                let runtime: Arc<dyn Runtime> = Arc::new(crate::TokioRuntime);
+                let finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let observed = finished.clone();
+                let attempt = streaming_download_and_decrypt_mapped(
+                    &http,
+                    &runtime,
+                    &request,
+                    ExpectedMediaHashes::from_downloadable(&params),
+                    Cursor::new(Vec::new()),
+                    move |writer| {
+                        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        (writer.into_inner(), std::thread::current().id())
+                    },
+                )
+                .await
+                .unwrap();
+                match (case, attempt) {
+                    (Case::Valid, WriterAttempt::Verified((bytes, worker))) => {
+                        assert_eq!(bytes, plaintext);
+                        assert_ne!(worker, caller);
+                        assert_eq!(finished.load(std::sync::atomic::Ordering::SeqCst), 1);
+                    }
+                    (case, WriterAttempt::Failed(_, error)) => {
+                        assert_eq!(finished.load(std::sync::atomic::Ordering::SeqCst), 0);
+                        let error = error.into_anyhow();
+                        assert!(matches!(
+                            (case, error.downcast_ref::<MediaDecryptionError>()),
+                            (Case::BadMac, Some(MediaDecryptionError::InvalidMac))
+                                | (
+                                    Case::BadEncryptedHash,
+                                    Some(MediaDecryptionError::EncryptedSha256Mismatch)
+                                )
+                                | (
+                                    Case::BadPlaintextHash,
+                                    Some(MediaDecryptionError::PlaintextSha256Mismatch)
+                                )
+                        ));
+                    }
+                    _ => panic!("unverified output was finalized"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_final_rewind_never_finalizes_output() {
+        struct RejectFinalRewind {
+            inner: Cursor<Vec<u8>>,
+            seeks: usize,
+        }
+        impl Write for RejectFinalRewind {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.inner.write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.inner.flush()
+            }
+        }
+        impl Seek for RejectFinalRewind {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                self.seeks += 1;
+                if self.seeks == 2 {
+                    return Err(std::io::Error::other("synthetic final rewind failure"));
+                }
+                self.inner.seek(position)
+            }
+        }
+        impl DownloadWriter for RejectFinalRewind {
+            fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+                self.inner.truncate(len)
+            }
+        }
+        for streaming in [false, true] {
+            let (params, body) = encrypted_params(b"verified but not finalized");
+            let request =
+                DownloadUtils::prepare_download_requests(&params, &MediaRoute::default_hosts())
+                    .unwrap()
+                    .remove(0);
+            let http: Arc<dyn HttpClient> = if streaming {
+                RoutedHttpClient::streaming(Vec::new(), (200, body))
+            } else {
+                RoutedHttpClient::new(Vec::new(), (200, body))
+            };
+            let runtime: Arc<dyn Runtime> = Arc::new(crate::TokioRuntime);
+            let attempt = streaming_download_and_decrypt_mapped(
+                &http,
+                &runtime,
+                &request,
+                ExpectedMediaHashes::from_downloadable(&params),
+                RejectFinalRewind {
+                    inner: Cursor::new(Vec::new()),
+                    seeks: 0,
+                },
+                |_| panic!("a failed rewind must not finalize output"),
+            )
+            .await
+            .unwrap();
+            let WriterAttempt::Failed(_, DownloadRequestError::WriterIo(error)) = attempt else {
+                panic!("final rewind failure lost its writer classification");
+            };
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::Other
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn cancellation_during_writer_io_stops_at_next_boundary() {
         struct CancelOnWrite {
             sink: SharedWriter,
@@ -3772,6 +4017,53 @@ mod tests {
             "expected NoHosts, got {err:?}"
         );
         assert!(http.urls().is_empty());
+    }
+
+    #[test]
+    fn integrity_metadata_uses_one_allocation_per_attempt() {
+        let (params, _) = encrypted_params(b"synthetic integrity metadata");
+        let allocations =
+            crate::test_alloc::min_allocs(1, || ExpectedMediaHashes::from_downloadable(&params));
+        assert_eq!(allocations, 1);
+    }
+
+    #[test]
+    fn inline_integrity_metadata_preserves_malformed_hashes_for_rejection() {
+        for encrypted_domain in [false, true] {
+            for len in [0, 1, 31, 32, 33, 129] {
+                let plaintext = b"synthetic integrity metadata";
+                let (mut params, mut body) = encrypted_params(plaintext);
+                let request =
+                    DownloadUtils::prepare_download_requests(&params, &MediaRoute::default_hosts())
+                        .unwrap()
+                        .remove(0);
+                let expected = if encrypted_domain {
+                    params.file_enc_sha256.as_mut().unwrap()
+                } else {
+                    &mut params.file_sha256
+                };
+                expected.resize(len, 0);
+                let hashes = ExpectedMediaHashes::from_downloadable(&params);
+                let result =
+                    decrypt_or_validate_buffered_body(&mut body, &request.decryption, &hashes);
+                if len == 32 {
+                    result.unwrap();
+                    assert_eq!(body, plaintext);
+                } else {
+                    let DownloadRequestError::Other(error) = result.unwrap_err() else {
+                        panic!("malformed integrity metadata must fail validation");
+                    };
+                    assert!(matches!(
+                        (
+                            encrypted_domain,
+                            error.downcast_ref::<MediaDecryptionError>()
+                        ),
+                        (true, Some(MediaDecryptionError::EncryptedSha256Mismatch))
+                            | (false, Some(MediaDecryptionError::PlaintextSha256Mismatch))
+                    ));
+                }
+            }
+        }
     }
 
     #[tokio::test]

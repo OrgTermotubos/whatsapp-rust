@@ -5,6 +5,28 @@ use std::path::Path;
 use std::process::{Command, Output};
 use xtask_support::{capture, write, write_json};
 
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessStats {
+    user_seconds: f64,
+    system_seconds: f64,
+    max_rss_kib: u64,
+    minor_faults: u64,
+    major_faults: u64,
+    exit_code: i32,
+}
+
+fn measured_command(executable: &str, stats: &Path) -> Command {
+    let mut command = Command::new("/usr/bin/time");
+    command.env("LC_ALL", "C").args([
+        "--quiet",
+        "--format",
+        r#"{"user_seconds":%U,"system_seconds":%S,"max_rss_kib":%M,"minor_faults":%R,"major_faults":%F,"exit_code":%x}"#,
+        "--output",
+    ]).arg(stats).args(["--", executable]);
+    command
+}
+
 pub fn run(root: &Path, out_dir: &Path) -> Result<()> {
     if out_dir.exists() {
         ensure!(
@@ -83,6 +105,7 @@ pub fn run(root: &Path, out_dir: &Path) -> Result<()> {
             "profile": "bench",
             "features": "default,bench-harness,sqlite-storage-bundled",
             "allocator_environment": allocator_environment,
+            "process_stats": "GNU time whole-process CPU, page faults and peak RSS; LC_ALL=C",
             "scope": "synthetic warm fixtures; System timing and separate global DHAT Rust heap; no RSS or TCP/TLS; shared runner timing is observational",
         }),
     )?;
@@ -110,17 +133,35 @@ pub fn run(root: &Path, out_dir: &Path) -> Result<()> {
                 let stdout = std::fs::File::create(out_dir.join(format!("{stem}.jsonl")))?;
                 let stderr = std::fs::File::create(out_dir.join(format!("{stem}.stderr")))?;
                 let name = format!("runtime_{kind}");
-                let status = Command::new(&executables[&name])
+                let stats_path = out_dir.join(format!("{stem}.process.json"));
+                let status = measured_command(&executables[&name], &stats_path)
                     .current_dir(root)
                     .args([scenario, workers, clients, samples])
                     .stdout(stdout)
                     .stderr(stderr)
                     .status()
                     .with_context(|| format!("running {stem}"))?;
+                write_json(
+                    &out_dir.join(format!("{stem}.status.json")),
+                    &json!({
+                        "success": status.success(),
+                        "code": status.code(),
+                    }),
+                )?;
                 ensure!(
                     status.success(),
                     "{stem} failed with {status}; see its stderr artifact"
                 );
+                let stats: ProcessStats = serde_json::from_slice(&std::fs::read(&stats_path)?)?;
+                ensure!(
+                    stats.exit_code == 0
+                        && stats.user_seconds.is_finite()
+                        && stats.user_seconds >= 0.0
+                        && stats.system_seconds.is_finite()
+                        && stats.system_seconds >= 0.0,
+                    "invalid process statistics for {stem}"
+                );
+                write_json(&stats_path, &stats)?;
                 let rows = std::fs::read_to_string(out_dir.join(format!("{stem}.jsonl")))?;
                 let rows = rows
                     .lines()
@@ -159,6 +200,41 @@ fn capture_build(command: &mut Command, out_dir: &Path) -> Result<Output> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn process_measurement_preserves_failed_child_status_and_diagnostics() {
+        let output_dir = tempfile::tempdir().unwrap();
+        let stats_path = output_dir.path().join("process.json");
+        let output = measured_command(
+            std::env::current_exe().unwrap().to_str().unwrap(),
+            &stats_path,
+        )
+        .env("XTASK_COMPILER_FAILURE_FIXTURE", "1")
+        .args([
+            "--ignored",
+            "--exact",
+            "runtime_probes::tests::compiler_error_child",
+            "--nocapture",
+        ])
+        .output()
+        .unwrap();
+        assert_eq!(output.status.code(), Some(23));
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("synthetic compiler error")
+        );
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("synthetic cargo failure summary")
+        );
+        let stats: ProcessStats =
+            serde_json::from_slice(&std::fs::read(stats_path).unwrap()).unwrap();
+        assert_eq!(stats.exit_code, 23);
+        assert!(stats.user_seconds >= 0.0 && stats.system_seconds >= 0.0);
+    }
 
     #[test]
     #[ignore = "subprocess fixture"]

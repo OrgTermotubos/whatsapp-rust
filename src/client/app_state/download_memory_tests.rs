@@ -101,6 +101,46 @@ fn is_memory_error(error: &anyhow::Error) -> bool {
 }
 
 #[tokio::test]
+async fn prefetch_admits_only_configured_jobs_and_refills_after_completion() {
+    use std::task::{Context, Poll};
+
+    for concurrency in [1, 2, 4] {
+        let (reference, body) = fixture(32);
+        let (client, http) = client(192, concurrency, body, true).await;
+        let lists: Vec<_> = (0..6)
+            .map(|index| {
+                let mut reference = reference.clone();
+                reference.direct_path = Some(format!("/synthetic-{index}"));
+                list(reference)
+            })
+            .collect();
+        let route_gate = client.media_conn.write().await;
+        let mut prefetch = Box::pin(client.pre_download_external_blobs(&lists));
+        let mut context = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(matches!(
+            prefetch.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        let budget = client.cache_config.app_state_downloads.budget();
+        assert_eq!(budget.used(), concurrency * 32);
+        assert_eq!(http.calls.load(Ordering::SeqCst), 0);
+        drop(prefetch);
+        assert_eq!(budget.used(), 0);
+        drop(route_gate);
+
+        let blobs = client.pre_download_external_blobs(&lists).await;
+        assert_eq!(blobs.len(), lists.len());
+        for blob in blobs.values() {
+            assert_eq!(blob.as_ref().unwrap().as_ref(), &[7; 32]);
+        }
+        assert_eq!(budget.used(), 192);
+        assert_eq!(http.calls.load(Ordering::SeqCst), 6);
+        drop(blobs);
+        assert_eq!(budget.used(), 0);
+    }
+}
+
+#[tokio::test]
 async fn batch_sum_is_bounded_without_waiting_for_its_own_results() {
     for concurrency in [1, 4] {
         let (reference, body) = fixture(32);

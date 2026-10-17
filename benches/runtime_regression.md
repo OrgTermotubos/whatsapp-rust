@@ -16,6 +16,12 @@ Native Divan allocation columns exclude executor and blocking threads outside
 Divan's control. Use the global DHAT probe for concurrent heap measurements.
 CodSpeed uses its own instruments; compare matching instruments and environments.
 
+The CI executor also records whole-process CPU time, page faults and peak RSS
+through GNU time. These include fixture setup and teardown, unlike the measured
+regions in JSONL. Allocator controls belong in separate diagnostic runs. Moving
+allocation between threads can change heap trimming and page faults even when
+the cryptographic work stays the same.
+
 Build each revision with the same toolchain, lockfile, profile and features.
 When comparing older revisions, apply exactly the same additive probe sources
 and Cargo example registrations to both trees. Preserve executables before

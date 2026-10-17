@@ -82,8 +82,7 @@ async fn app_state_async_frames_fit_small_heap_blocks() {
         (
             "blob_job",
             size_of_val(
-                &client
-                    .external_blob_job(reference.clone(), BlobKind::Snapshot(WAPatchName::Regular)),
+                &client.external_blob_job(&reference, BlobKind::Snapshot(WAPatchName::Regular)),
             ),
         ),
         (
@@ -152,6 +151,7 @@ async fn refused_prefetch_jobs_do_not_allocate_download_sized_nodes() {
             let mut reference = wa::ExternalBlobReference::default();
             reference.direct_path = Some(format!("/synthetic-{index}"));
             reference.file_size_bytes = Some(65536);
+            reference.handle = Some("synthetic-unused-handle".repeat(256));
             wacore::appstate::patch_decode::PatchList {
                 name: WAPatchName::Regular,
                 has_more_patches: false,
