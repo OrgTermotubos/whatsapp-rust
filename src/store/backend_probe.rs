@@ -45,6 +45,33 @@ macro_rules! forward_domains {
                 self.backend.reuse_session_flush_buffer()
             }
 
+            fn put_session_reclaim<'s, 'async_trait>(
+                &'s self,
+                address: Arc<str>,
+                session: Bytes,
+            ) -> BoxFuture<'async_trait, (Result<()>, Bytes)>
+            where
+                's: 'async_trait,
+                Self: 'async_trait,
+            {
+                Box::pin(async move {
+                    // This is the same logical batch write, with one owned input.
+                    self.before_call("put_sessions_batch").await;
+                    if let Some((method, failing)) = &self.fail_before_method
+                        && *method == "put_sessions_batch"
+                        && failing.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        return (Err(wacore::store::error::StoreError::Io(std::io::Error::other("synthetic failure before commit"))), session);
+                    }
+                    let (mut result, session) = self.backend.put_session_reclaim(address, session).await;
+                    self.before_call("after:put_sessions_batch").await;
+                    if self.fail_after_method == Some("put_sessions_batch") {
+                        result = Err(wacore::store::error::StoreError::Io(std::io::Error::other("synthetic failure after commit")));
+                    }
+                    (result, session)
+                })
+            }
+
             forward_methods! {
                 fn put_identity<'s, 'a>(this: &'s Self, address: &'a str, key: [u8; 32]) -> Result<()>;
                 fn put_identities_batch<'s, 'a>(this: &'s Self, identities: &'a [(Arc<str>, [u8; 32])]) -> Result<()>;

@@ -251,7 +251,7 @@ impl Client {
             ))
             .await;
         }
-        if to.is_group() && Box::pin(self.is_community_announce_group(to)).await? {
+        if to.is_group() && self.is_community_announce_group(to).await? {
             return Err(crate::SendError::InvalidRequest(
                 "community announcement group edits require EditRequest::with_secret and the original message secret".into(),
             ));
@@ -307,7 +307,7 @@ impl Client {
         // returns LID for LID-addressing groups and PN otherwise.
         let participant = if to.is_group() {
             Some(
-                Box::pin(self.get_own_jid_for_group(&to))
+                self.get_own_jid_for_group(&to)
                     .await
                     .map_err(crate::send::SendError::from_anyhow)?
                     .to_non_ad()

@@ -645,6 +645,18 @@ pub trait SignalStore: Send + Sync {
         false
     }
 
+    /// Persist one session while lending its owned allocation to the backend.
+    ///
+    /// Used only for single-session flushes opting into reusable scratch space.
+    /// The returned bytes are scratch, not proof of what reached storage. This
+    /// default preserves the backend's batch override and returns the input.
+    async fn put_session_reclaim(&self, address: Arc<str>, session: Bytes) -> (Result<()>, Bytes) {
+        let sessions = [(address, session)];
+        let result = self.put_sessions_batch(&sessions).await;
+        let [(_, session)] = sessions;
+        (result, session)
+    }
+
     /// Store multiple encrypted sessions in a single batch operation.
     /// Default implementation falls back to individual `put_session` calls.
     async fn put_sessions_batch(&self, sessions: &[(Arc<str>, Bytes)]) -> Result<()> {

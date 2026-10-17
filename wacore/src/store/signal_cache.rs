@@ -2218,7 +2218,7 @@ impl SignalStoreCache {
         addresses: Option<&[Arc<str>]>,
         pool: &mut SessionFlushBuffer,
     ) -> Result<()> {
-        let (batch, versions, deleted, mut prekeys) = {
+        let (mut batch, versions, deleted, mut prekeys) = {
             let state = self.lock_sessions().await;
             let SessionFlushBatch {
                 records: batch,
@@ -2253,10 +2253,19 @@ impl SignalStoreCache {
         };
 
         if !batch.is_empty() {
-            let result = backend.put_sessions_batch(&batch).await;
-            if backend.session_flush_batch_limit().max(1) == 1
-                && backend.reuse_session_flush_buffer()
-            {
+            let reuse = backend.session_flush_batch_limit().max(1) == 1
+                && backend.reuse_session_flush_buffer();
+            let result = if reuse && batch.len() == 1 {
+                let (address, session) = &mut batch[0];
+                let (result, reusable) = backend
+                    .put_session_reclaim(address.clone(), std::mem::take(session))
+                    .await;
+                *session = reusable;
+                result
+            } else {
+                backend.put_sessions_batch(&batch).await
+            };
+            if reuse {
                 reclaim_session_buffer(pool, batch);
             }
             result?;

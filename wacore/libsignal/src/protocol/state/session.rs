@@ -1616,19 +1616,24 @@ impl SessionRecord {
 
     /// Encode into a caller-supplied buffer (allows reuse across flushes).
     pub fn serialize_into(&self, buf: &mut Vec<u8>) {
-        self.serialize_into_inner(buf, None);
+        self.serialize_into_inner(buf, None, false);
     }
 
     /// The incarnation prevents clean reloads from looking like crashes.
     #[doc(hidden)]
     pub fn serialize_into_for_store(&self, buf: &mut Vec<u8>, incarnation: &[u8; 16]) {
-        self.serialize_into_inner(buf, Some(incarnation));
+        self.serialize_into_inner(buf, Some(incarnation), true);
     }
 
     // Session storage protos are hand-spliced only here; direct buffa calls
     // duplicate nothing, so no codec pin.
     #[allow(clippy::disallowed_methods)]
-    fn serialize_into_inner(&self, buf: &mut Vec<u8>, incarnation: Option<&[u8; 16]>) {
+    fn serialize_into_inner(
+        &self,
+        buf: &mut Vec<u8>,
+        incarnation: Option<&[u8; 16]>,
+        exact_capacity: bool,
+    ) {
         use buffa::encoding::{Tag, WireType, encode_varint, varint_len};
 
         let mut cache = buffa::SizeCache::new();
@@ -1667,7 +1672,14 @@ impl SessionRecord {
             .unwrap_or(0);
 
         buf.clear();
-        buf.reserve(current_len + previous_len + reserved_len + incarnation_len);
+        let encoded_len = current_len + previous_len + reserved_len + incarnation_len;
+        if exact_capacity {
+            // Store flushes already know the complete length. Do not double a
+            // reused scratch allocation when a record grows just past its cap.
+            buf.reserve_exact(encoded_len);
+        } else {
+            buf.reserve(encoded_len);
+        }
 
         if let Some(session) = current.as_ref()
             && let Some(msg_len) = current_msg_len
@@ -2904,6 +2916,18 @@ mod tests {
         let mut reused = vec![0xaa; 16];
         record.serialize_into(&mut reused);
         assert_eq!(reused, expected);
+    }
+
+    #[test]
+    fn store_serialization_does_not_double_a_growing_scratch_buffer() {
+        let record = create_record_with_previous_sessions(4);
+        let mut expected = Vec::new();
+        record.serialize_into_for_store(&mut expected, &[9; 16]);
+        let mut reused = Vec::with_capacity(expected.len() - 1);
+        let previous_capacity = reused.capacity();
+        record.serialize_into_for_store(&mut reused, &[9; 16]);
+        assert_eq!(reused, expected);
+        assert!(reused.capacity() < previous_capacity * 2);
     }
 
     #[test]
