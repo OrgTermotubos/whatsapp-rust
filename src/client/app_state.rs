@@ -985,18 +985,25 @@ impl Client {
 
         let policy = &self.cache_config.app_state_downloads;
         let mut pre_downloaded = HashMap::with_capacity(jobs.len());
-        let mut jobs = jobs.into_iter();
-        let mut in_flight = futures::stream::FuturesUnordered::new();
-        loop {
-            while in_flight.len() < policy.config.concurrency().get() {
-                let Some((ext, kind)) = jobs.next() else {
-                    break;
-                };
-                in_flight.push(self.external_blob_job(ext, kind));
-            }
-            let Some((path, kind, result)) = in_flight.next().await else {
-                break;
-            };
+        // A small batch that fits admission has no refill work. Join its thin
+        // jobs directly instead of allocating a wake-queue node per download.
+        // Keep larger batches on the ready queue so polling stays scalable.
+        let mut completed = if jobs.len() <= 4 && jobs.len() <= policy.config.concurrency().get() {
+            futures::stream::iter(
+                futures::future::join_all(
+                    jobs.into_iter()
+                        .map(|(ext, kind)| self.external_blob_job(ext, kind)),
+                )
+                .await,
+            )
+            .left_stream()
+        } else {
+            futures::stream::iter(jobs)
+                .map(|(ext, kind)| self.external_blob_job(ext, kind))
+                .buffer_unordered(policy.config.concurrency().get())
+                .right_stream()
+        };
+        while let Some((path, kind, result)) = completed.next().await {
             match &result {
                 Ok(bytes) => match kind {
                     BlobKind::Mutation(version) => {
