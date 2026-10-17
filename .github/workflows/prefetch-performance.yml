@@ -1,4 +1,4 @@
-name: Prefetch performance experiment
+name: Dashboard JSON performance experiment
 
 on:
   push:
@@ -22,8 +22,7 @@ env:
 
 jobs:
   prefetch:
-    if: github.event_name == 'workflow_dispatch'
-    name: Prefetch (${{ matrix.mode }})
+    name: Dashboard JSON (${{ matrix.mode }})
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
@@ -47,45 +46,32 @@ jobs:
           tool: protoc@3.25.3,cargo-codspeed@5.0.2
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: prefetch-performance-${{ matrix.mode }}
+          prefix-key: dashboard-json-${{ matrix.mode }}
           cache-targets: "true"
           cache-workspace-crates: "true"
+      - uses: actions/checkout@v7
+        with:
+          repository: oxidezap/whatsapp-rust-esp32
+          ref: d603f81d36100f4265531450e21ef39d000c8121
+          path: consumer
+          persist-credentials: false
       - name: Record source and host
         run: |
           git rev-parse HEAD
+          git -C consumer rev-parse HEAD
+          sha256sum consumer/src/supervisor/message_log.rs Cargo.lock
           rustc -Vv
           lscpu
-      # CodSpeed groups uploads from this workflow run. Distinct benchmark
-      # names keep each pinned production implementation separate in that run.
-      # Compare the small-batch join with the unchanged production reference.
-      - name: Build prefetch benchmark
+      # Both implementations run in the same binary with the same fixture.
+      - name: Build dashboard JSON benchmarks
         env:
           BUILD_MODES: ${{ matrix.build }}
         run: |
           git rev-parse HEAD
-          cargo codspeed build $BUILD_MODES -p whatsapp-rust --features bench-harness --bench appstate_prefetch
-      - name: Measure prefetch
+          cargo codspeed build $BUILD_MODES -p whatsapp-rust --features bench-harness --bench dashboard_json
+      - name: Measure dashboard JSON
         uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369
         with:
           mode: ${{ matrix.mode }}
           runner-version: "5.4.2"
-          run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
-      - name: Build the pinned mutex reference
-        env:
-          BUILD_MODES: ${{ matrix.build }}
-        run: |
-          git reset --hard a2f6bd940cb88bcc4e70f056aad34c5172ec8db8
-          git rev-parse HEAD
-          sed -i -E 's/^fn (four_external_blobs|eight_clients|streaming_vec|streaming_accounted)\(/fn reference_\1(/' benches/appstate_prefetch.rs
-          git diff -- benches/appstate_prefetch.rs
-          sha256sum Cargo.lock src/client/app_state/prefetch_bench.rs
-          cargo codspeed build $BUILD_MODES -p whatsapp-rust --features bench-harness --bench appstate_prefetch
-      - name: Measure the pinned mutex reference
-        uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369
-        with:
-          mode: ${{ matrix.mode }}
-          runner-version: "5.4.2"
-          run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
-      - name: Restore candidate source
-        if: always()
-        run: git reset --hard "$GITHUB_SHA"
+          run: cargo codspeed run -p whatsapp-rust --bench dashboard_json

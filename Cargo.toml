@@ -453,6 +453,11 @@ harness = false
 required-features = ["bench-harness"]
 
 [[bench]]
+name = "dashboard_json"
+harness = false
+required-features = ["bench-harness"]
+
+[[bench]]
 name = "client_group_scale"
 harness = false
 required-features = ["bench-harness"]
