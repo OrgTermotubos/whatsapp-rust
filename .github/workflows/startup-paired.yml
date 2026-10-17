@@ -1,0 +1,127 @@
+name: Paired startup simulation confirmation
+on:
+  push:
+    branches: [agent/startup-comparison]
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+env:
+  CARGO_TERM_COLOR: never
+  MALLOC_ARENA_MAX: "1"
+  MALLOC_MMAP_THRESHOLD_: "131072"
+  MALLOC_TRIM_THRESHOLD_: "131072"
+  MALLOC_TOP_PAD_: "131072"
+jobs:
+  startup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    services:
+      mock-server:
+        image: ghcr.io/whiskeysockets-devtools/bartender@sha256:9f3a49dd9f944414fbda50571bba5f66f2ab6fdc48001e6803d4c09a1042c78e
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.BARTENDER_GHCR_TOKEN }}
+        ports:
+          - 8080:8080
+        env:
+          CHATSTATE_TTL_SECS: "3"
+        options: --log-driver none
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@3.25.3,cargo-codspeed@5.0.2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: paired-startup-simulation
+          cache-targets: "true"
+          cache-workspace-crates: "true"
+      - name: Record shared host and compiler
+        run: |
+          rustc -Vv
+          lscpu
+      - name: Wait for mock server
+        run: cargo xt ci workflow wait-for-mock
+      - name: Build pinned pair 1 reference
+        run: |
+          git reset --hard f47c529ce84eaf62a6636f28d339c3fcb175f4e1
+          git rev-parse HEAD
+          sha256sum Cargo.lock tests/bench-integration/benches/integration.rs tests/e2e/src/lib.rs
+          sed -i 's/^fn connect_to_ready(/fn pair1_reference_connect_to_ready(/' tests/bench-integration/benches/integration.rs
+          cargo codspeed build -m simulation -p bench-integration --bench integration
+          # The compiled binary stays pinned above. Restore the workflow SHA
+          # before upload so this experiment cannot overwrite PR-head checks.
+          git reset --hard "$GITHUB_SHA"
+      - name: Measure pair 1 reference complete connect and shutdown
+        uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369
+        env:
+          MOCK_SERVER_URL: "wss://127.0.0.1:8080/ws/chat"
+          RUST_LOG: warn
+        with:
+          mode: simulation
+          runner-version: "5.4.2"
+          run: cargo codspeed run -p bench-integration --bench integration pair1_reference_connect_to_ready
+      - name: Build pinned pair 1 candidate
+        run: |
+          git reset --hard 3244be404c3b0596e3fc438e3590875422d1893b
+          git rev-parse HEAD
+          sha256sum Cargo.lock tests/bench-integration/benches/integration.rs tests/e2e/src/lib.rs
+          sed -i 's/^fn connect_to_ready(/fn pair1_candidate_connect_to_ready(/' tests/bench-integration/benches/integration.rs
+          cargo codspeed build -m simulation -p bench-integration --bench integration
+          # The compiled binary stays pinned above. Restore the workflow SHA
+          # before upload so this experiment cannot overwrite PR-head checks.
+          git reset --hard "$GITHUB_SHA"
+      - name: Measure pair 1 candidate complete connect and shutdown
+        uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369
+        env:
+          MOCK_SERVER_URL: "wss://127.0.0.1:8080/ws/chat"
+          RUST_LOG: warn
+        with:
+          mode: simulation
+          runner-version: "5.4.2"
+          run: cargo codspeed run -p bench-integration --bench integration pair1_candidate_connect_to_ready
+      - name: Build pinned pair 2 candidate
+        run: |
+          git reset --hard 3244be404c3b0596e3fc438e3590875422d1893b
+          git rev-parse HEAD
+          sha256sum Cargo.lock tests/bench-integration/benches/integration.rs tests/e2e/src/lib.rs
+          sed -i 's/^fn connect_to_ready(/fn pair2_candidate_connect_to_ready(/' tests/bench-integration/benches/integration.rs
+          cargo codspeed build -m simulation -p bench-integration --bench integration
+          # The compiled binary stays pinned above. Restore the workflow SHA
+          # before upload so this experiment cannot overwrite PR-head checks.
+          git reset --hard "$GITHUB_SHA"
+      - name: Measure pair 2 candidate complete connect and shutdown
+        uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369
+        env:
+          MOCK_SERVER_URL: "wss://127.0.0.1:8080/ws/chat"
+          RUST_LOG: warn
+        with:
+          mode: simulation
+          runner-version: "5.4.2"
+          run: cargo codspeed run -p bench-integration --bench integration pair2_candidate_connect_to_ready
+      - name: Build pinned pair 2 reference
+        run: |
+          git reset --hard f47c529ce84eaf62a6636f28d339c3fcb175f4e1
+          git rev-parse HEAD
+          sha256sum Cargo.lock tests/bench-integration/benches/integration.rs tests/e2e/src/lib.rs
+          sed -i 's/^fn connect_to_ready(/fn pair2_reference_connect_to_ready(/' tests/bench-integration/benches/integration.rs
+          cargo codspeed build -m simulation -p bench-integration --bench integration
+          # The compiled binary stays pinned above. Restore the workflow SHA
+          # before upload so this experiment cannot overwrite PR-head checks.
+          git reset --hard "$GITHUB_SHA"
+      - name: Measure pair 2 reference complete connect and shutdown
+        uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369
+        env:
+          MOCK_SERVER_URL: "wss://127.0.0.1:8080/ws/chat"
+          RUST_LOG: warn
+        with:
+          mode: simulation
+          runner-version: "5.4.2"
+          run: cargo codspeed run -p bench-integration --bench integration pair2_reference_connect_to_ready
