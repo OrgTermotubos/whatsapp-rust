@@ -637,9 +637,10 @@ pub trait SignalStore: Send + Sync {
         usize::MAX
     }
 
-    /// Reuse a uniquely owned serialization buffer for single-session flushes.
-    /// The default retains no buffer. Opting in retains at most 8 KiB between
-    /// flushes; backends retaining shared bytes keep their ownership unchanged.
+    /// Reserve and reuse an 8 KiB scratch buffer for single-session flushes.
+    /// The first nonempty flush reserves fallibly; the default retains no buffer.
+    /// Larger records are still supported, but their oversized buffers are not
+    /// retained. Backends retaining shared bytes keep their ownership unchanged.
     fn reuse_session_flush_buffer(&self) -> bool {
         false
     }

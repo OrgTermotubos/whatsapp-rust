@@ -681,9 +681,21 @@ enum CachedSessionCheckout {
 }
 
 // Keep the default cache footprint to one pointer; allocate the Vec header
-// only after an opted-in backend releases a reusable buffer.
+// only for a backend opting into reusable scratch space.
 #[allow(clippy::box_collection)]
 type SessionFlushBuffer = Option<Box<Vec<u8>>>;
+
+const SESSION_FLUSH_BUFFER_CAPACITY: usize = 8192;
+
+fn reserve_session_buffer(pool: &mut SessionFlushBuffer) -> Result<()> {
+    let mut buffer = pool.take().unwrap_or_default();
+    buffer.clear();
+    let result = buffer.try_reserve_exact(SESSION_FLUSH_BUFFER_CAPACITY);
+    *pool = Some(buffer);
+    result
+        .map_err(|_| crate::store::error::StoreError::Io(std::io::ErrorKind::OutOfMemory.into()))?;
+    Ok(())
+}
 
 fn reclaim_session_buffer(pool: &mut SessionFlushBuffer, batch: Vec<(Arc<str>, bytes::Bytes)>) {
     for (_, bytes) in batch {
@@ -691,7 +703,7 @@ fn reclaim_session_buffer(pool: &mut SessionFlushBuffer, batch: Vec<(Arc<str>, b
             let mut bytes = Vec::from(bytes);
             let capacity = bytes.capacity();
             if capacity != 0
-                && capacity <= 8192
+                && capacity <= SESSION_FLUSH_BUFFER_CAPACITY
                 && pool
                     .as_ref()
                     .is_none_or(|saved| saved.capacity() < capacity)
@@ -715,6 +727,17 @@ struct SessionFlushBatch {
 #[cfg(test)]
 mod session_flush_buffer_tests {
     use super::*;
+
+    #[test]
+    fn initial_reservation_is_reused_without_growing() {
+        let mut pool = None;
+        reserve_session_buffer(&mut pool).unwrap();
+        let saved = pool.as_ref().unwrap();
+        let pointer = saved.as_ptr();
+        assert_eq!(saved.capacity(), SESSION_FLUSH_BUFFER_CAPACITY);
+        reserve_session_buffer(&mut pool).unwrap();
+        assert_eq!(pool.as_ref().unwrap().as_ptr(), pointer);
+    }
 
     #[test]
     fn unique_buffer_is_reused_without_reallocation() {
@@ -2157,7 +2180,8 @@ impl SignalStoreCache {
     ) -> Result<()> {
         let limit = backend.session_flush_batch_limit().max(1);
         let mut unused = None;
-        let pool = if limit == 1 && backend.reuse_session_flush_buffer() {
+        let reuse = limit == 1 && backend.reuse_session_flush_buffer();
+        let pool = if reuse {
             saved
         } else {
             *saved = None;
@@ -2175,6 +2199,11 @@ impl SignalStoreCache {
         };
         if addresses.is_empty() {
             return self.flush_session_batch(backend, Some(&[]), pool).await;
+        }
+        if reuse {
+            // Reserve the opted-in scratch space before serializing the first
+            // snapshot, rather than growing it later in a fragmented heap.
+            reserve_session_buffer(pool)?;
         }
         for addresses in addresses.chunks(limit) {
             self.flush_session_batch(backend, Some(addresses), pool)
@@ -4541,6 +4570,10 @@ mod consumed_prekey_atomicity_tests {
         #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         impl SignalStore for FailingSessions {
+            fn reuse_session_flush_buffer(&self) -> bool {
+                true
+            }
+
             fn session_flush_batch_limit(&self) -> usize {
                 1
             }
@@ -4658,6 +4691,11 @@ mod consumed_prekey_atomicity_tests {
 
         // The session write fails, so flush errors out before the prekey lane.
         assert!(cache.flush(&backend).await.is_err());
+        assert_eq!(
+            cache.flush_lock.lock().await.as_ref().unwrap().capacity(),
+            SESSION_FLUSH_BUFFER_CAPACITY,
+            "a failed write must return the unique scratch buffer to the pool"
+        );
 
         // The prekey must still be durable: it must never be deleted while its
         // session is not committed.
