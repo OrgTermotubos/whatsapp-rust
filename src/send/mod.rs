@@ -2660,10 +2660,23 @@ impl Client {
     ///
     /// `borrowed_stanza_id` names the outer stanza after another message, so
     /// the pipeline binds no ID-keyed state to it. `None` uses a fresh ID.
-    pub(crate) async fn send_built_message(
+    pub(crate) fn send_built_message(
         &self,
         to: Jid,
         message: wa::Message,
+        edit: EditAttribute,
+        borrowed_stanza_id: Option<String>,
+    ) -> impl Future<Output = Result<SendResult, SendError>> + '_ {
+        // Own the protobuf outside the coroutine. Edit/revoke callers otherwise
+        // retain its inline tree in every enclosing send future.
+        let message = std::sync::Arc::new(message);
+        self.send_shared_built_message(to, message, edit, borrowed_stanza_id)
+    }
+
+    async fn send_shared_built_message(
+        &self,
+        to: Jid,
+        message: std::sync::Arc<wa::Message>,
         edit: EditAttribute,
         borrowed_stanza_id: Option<String>,
     ) -> Result<SendResult, SendError> {
@@ -2674,7 +2687,6 @@ impl Client {
         let borrowed_message_id = borrowed_stanza_id.is_some();
         let request_id = borrowed_stanza_id
             .unwrap_or_else(|| self.generate_message_id_at(sent_at.unix_secs_u64()));
-        let message = std::sync::Arc::new(message);
         let result_to = to.clone();
         let recipient_fanout = self
             .send_message_impl(

@@ -1,0 +1,11 @@
+name: Qualify asynchronous streaming admission
+on:
+  push:
+    branches: [agent/http-admission-c3]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  correctness:
+    uses: ./.github/workflows/main.yml
+    secrets: inherit
