@@ -1,0 +1,18 @@
+[package]
+name = "consumer-nvs-record-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+divan = { package = "codspeed-divan-compat", version = "=5.0.2" }
+
+[[bench]]
+name = "nvs_record"
+harness = false
+
+[profile.bench]
+lto = "thin"
+debug = 1

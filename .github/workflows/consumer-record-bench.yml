@@ -1,0 +1,69 @@
+name: Consumer NVS extraction measurements
+on:
+  push:
+    branches: [agent/consumer-record-measurements]
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+env:
+  CARGO_TERM_COLOR: never
+  MALLOC_ARENA_MAX: "1"
+  MALLOC_MMAP_THRESHOLD_: "131072"
+  MALLOC_TRIM_THRESHOLD_: "131072"
+  MALLOC_TOP_PAD_: "131072"
+jobs:
+  record:
+    name: Same-binary NVS extraction (${{ matrix.kind }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kind: modeled-and-memory
+            build-mode: simulation
+            modes: simulation,memory
+          - kind: native
+            build-mode: walltime
+            modes: walltime
+    defaults:
+      run:
+        working-directory: tests/bench-consumer-nvs
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-codspeed@5.0.2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: consumer-record-${{ matrix.kind }}
+          workspaces: tests/bench-consumer-nvs -> target
+          cache-targets: "true"
+          cache-workspace-crates: "true"
+      - name: Fetch the exact production helper and record provenance
+        run: |
+          mkdir -p .ci-src
+          curl --fail --silent --show-error --location \
+            https://raw.githubusercontent.com/oxidezap/whatsapp-rust-esp32/6ff5c05605c47ba68ace29b2644a719fe6397ecf/src/storage/record_buffer.rs \
+            -o .ci-src/record_buffer.rs
+          printf '%s  %s\n' d4dd7a41414b77ba333b6a2a8cc3bbad63357b015626fede0745ce2b7e91eea4 .ci-src/record_buffer.rs | sha256sum --check
+          sha256sum Cargo.lock .ci-src/record_buffer.rs
+          rustc -Vv
+          lscpu
+      - name: Build controls and production extraction together
+        run: cargo codspeed build -m ${{ matrix.build-mode }} --bench nvs_record
+      - name: Measure both implementations
+        uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369
+        with:
+          mode: ${{ matrix.modes }}
+          runner-version: "5.4.2"
+          working-directory: tests/bench-consumer-nvs
+          run: cargo codspeed run --bench nvs_record
+      - name: Verify dependency lock stayed fixed
+        run: git diff --exit-code -- Cargo.lock
