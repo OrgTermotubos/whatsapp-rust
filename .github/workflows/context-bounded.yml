@@ -1,0 +1,11 @@
+name: Bound session flush memory after callback slimming
+on:
+  push:
+    branches: [agent/context-bounded-sessions]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  correctness:
+    uses: ./.github/workflows/main.yml
+    secrets: inherit

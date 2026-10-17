@@ -37,6 +37,10 @@ macro_rules! forward_methods {
 macro_rules! forward_domains {
     ($owner:ty) => {
         impl SignalStore for $owner {
+            fn session_flush_batch_limit(&self) -> usize {
+                self.backend.session_flush_batch_limit()
+            }
+
             forward_methods! {
                 fn put_identity<'s, 'a>(this: &'s Self, address: &'a str, key: [u8; 32]) -> Result<()>;
                 fn put_identities_batch<'s, 'a>(this: &'s Self, identities: &'a [(Arc<str>, [u8; 32])]) -> Result<()>;
