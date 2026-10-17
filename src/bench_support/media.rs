@@ -42,10 +42,8 @@ impl StreamingDecryptHarness {
 
     pub fn decrypt_accounted(&self) -> Result<()> {
         let budget = crate::download::memory::MemoryBudget::new(self.plaintext.len());
-        let mut output = crate::download::memory::MemoryWriter::bounded(
-            self.plaintext.len() as u64,
-            budget,
-        )?;
+        let mut output =
+            crate::download::memory::MemoryWriter::bounded(self.plaintext.len() as u64, budget)?;
         self.decrypt(&mut output)?;
         anyhow::ensure!(
             output.into_bytes().as_ref() == self.plaintext,
