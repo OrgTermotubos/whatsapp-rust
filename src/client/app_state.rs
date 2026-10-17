@@ -921,26 +921,18 @@ impl Client {
         })
     }
 
-    fn external_blob_job<'a>(
-        &'a self,
-        ext: &'a wa::ExternalBlobReference,
+    async fn external_blob_job(
+        &self,
+        ext: &wa::ExternalBlobReference,
         kind: BlobKind,
-    ) -> impl Future<
-        Output = (
-            Option<String>,
-            BlobKind,
-            std::result::Result<bytes::Bytes, crate::download::ClientDownloadError>,
-        ),
-    > + 'a {
-        let prepared = self
-            .prepare_memory_download(ext, self.cache_config.app_state_downloads.budget().clone());
-        async move {
-            let result = match prepared {
-                Ok(writer) => Box::pin(self.download_prepared_memory(ext, writer)).await,
-                Err(error) => Err(error),
-            };
-            (ext.direct_path.clone(), kind, result)
-        }
+        writer: crate::download::memory::MemoryWriter,
+    ) -> (
+        Option<String>,
+        BlobKind,
+        std::result::Result<bytes::Bytes, crate::download::ClientDownloadError>,
+    ) {
+        let result = self.download_prepared_memory(ext, writer).await;
+        (ext.direct_path.clone(), kind, result)
     }
 
     /// Pre-download every external blob (snapshots + patch external mutations)
@@ -992,7 +984,24 @@ impl Client {
                 let Some((ext, kind)) = jobs.next() else {
                     break;
                 };
-                in_flight.push(self.external_blob_job(ext, kind));
+                // Refused jobs never need a download-sized future. Admitted
+                // jobs live directly in the stream node, avoiding a second box.
+                match self.prepare_memory_download(ext, policy.budget().clone()) {
+                    Ok(writer) => in_flight.push(self.external_blob_job(ext, kind, writer)),
+                    Err(error) => {
+                        match kind {
+                            BlobKind::Snapshot(name) => {
+                                warn!("Failed to download external snapshot for {name:?}: {error}")
+                            }
+                            BlobKind::Mutation(version) => warn!(
+                                "Failed to download external mutations for patch v{version}: {error}"
+                            ),
+                        }
+                        if let Some(path) = &ext.direct_path {
+                            pre_downloaded.insert(path.clone(), Err(Arc::new(error)));
+                        }
+                    }
+                }
             }
             let Some((path, kind, result)) = in_flight.next().await else {
                 break;

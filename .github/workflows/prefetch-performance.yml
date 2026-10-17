@@ -31,6 +31,8 @@ jobs:
         include:
           - mode: walltime
             build: -m walltime
+          - mode: simulation,memory
+            build: -m simulation -m memory
     steps:
       - uses: actions/checkout@v7
         with:
@@ -54,7 +56,7 @@ jobs:
           lscpu
       # CodSpeed groups uploads from this workflow run. Distinct benchmark
       # names keep each pinned production implementation separate in that run.
-      # Reverse the first matched run's order for a fresh-process confirmation.
+      # Measure the admission-node candidate against unchanged pinned references.
       - name: Build prefetch benchmark
         env:
           BUILD_MODES: ${{ matrix.build }}
