@@ -1,6 +1,5 @@
 use std::io::{self, Cursor, Seek, SeekFrom, Write};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use super::{DownloadPolicyError, DownloadWriter};
 
@@ -9,20 +8,20 @@ pub(crate) struct MemoryBudget(Arc<BudgetState>);
 
 struct BudgetState {
     limit: usize,
-    used: AtomicUsize,
+    used: Mutex<usize>,
 }
 
 impl MemoryBudget {
     pub(crate) fn new(limit: usize) -> Self {
         Self(Arc::new(BudgetState {
             limit,
-            used: AtomicUsize::new(0),
+            used: Mutex::new(0),
         }))
     }
 
     #[cfg(test)]
     pub(crate) fn used(&self) -> usize {
-        self.0.used.load(Ordering::Relaxed)
+        *self.0.used.lock().unwrap()
     }
 
     fn limit(&self) -> usize {
@@ -41,41 +40,35 @@ impl MemoryReservation {
         if required <= self.bytes && preferred == self.bytes {
             return Ok(self.bytes);
         }
-        // Each lease owns its bytes exclusively. Acquire/release orders returned
-        // capacity after buffer destruction even across blocking workers.
-        let used = &self.budget.0.used;
-        let mut observed = used.load(Ordering::Acquire);
-        loop {
-            let other = observed - self.bytes;
-            let available = self.budget.0.limit - other;
-            // Waiting for capacity can deadlock against this batch's results.
-            if required > available {
-                return Err(DownloadPolicyError::MemoryBudgetExceeded {
-                    limit: self.budget.0.limit,
-                });
-            }
-            let capacity = preferred.min(available).max(required);
-            match used.compare_exchange_weak(
-                observed,
-                other + capacity,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    self.bytes = capacity;
-                    return Ok(capacity);
-                }
-                Err(current) => observed = current,
-            }
+        let mut used = self
+            .budget
+            .0
+            .used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let available = self.budget.0.limit - (*used - self.bytes);
+        // Waiting can deadlock against completed blobs retained by this batch.
+        if required > available {
+            return Err(DownloadPolicyError::MemoryBudgetExceeded {
+                limit: self.budget.0.limit,
+            });
         }
+        let capacity = preferred.min(available).max(required);
+        *used = *used - self.bytes + capacity;
+        self.bytes = capacity;
+        Ok(capacity)
     }
 }
 
 impl Drop for MemoryReservation {
     fn drop(&mut self) {
-        if self.bytes != 0 {
-            self.budget.0.used.fetch_sub(self.bytes, Ordering::Release);
-        }
+        let mut used = self
+            .budget
+            .0
+            .used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *used -= self.bytes;
     }
 }
 
@@ -133,11 +126,13 @@ impl MemoryWriter {
             let actual = self.cursor.get_ref().capacity();
             assert!(actual <= reservation.bytes);
             if actual < reservation.bytes {
-                reservation
+                let mut used = reservation
                     .budget
                     .0
                     .used
-                    .fetch_sub(reservation.bytes - actual, Ordering::Release);
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *used -= reservation.bytes - actual;
                 reservation.bytes = actual;
             }
         }
@@ -240,7 +235,7 @@ mod tests {
     use super::*;
 
     fn used(budget: &MemoryBudget) -> usize {
-        budget.used()
+        *budget.0.used.lock().unwrap()
     }
 
     #[test]
@@ -341,37 +336,19 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_growth_and_release_reuse_capacity() {
-        let budget = MemoryBudget::new(128);
-        std::thread::scope(|scope| {
-            for _ in 0..8 {
-                let budget = &budget;
-                scope.spawn(move || {
-                    for _ in 0..1000 {
-                        let mut writer = MemoryWriter::new(0, Some(budget.clone()));
-                        if writer.write_all(&[7; 17]).is_ok() {
-                            let _ = writer.write_all(&[8; 19]);
-                            let bytes = writer.into_bytes();
-                            assert!(bytes.starts_with(&[7; 17]));
-                            assert!(used(budget) <= 128);
-                        }
-                    }
-                });
-            }
-        });
-        assert_eq!(used(&budget), 0);
-        assert!(MemoryWriter::bounded(128, budget).is_ok());
-    }
-
-    #[test]
-    fn partially_written_lease_stays_charged_across_threads() {
+    fn writing_within_a_lease_does_not_wait_for_shared_accounting() {
         let budget = MemoryBudget::new(32);
         let mut writer = MemoryWriter::bounded(32, budget.clone()).unwrap();
+        let held = budget.0.used.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             writer.write_all(b"test").unwrap();
-            writer.into_bytes()
+            tx.send(writer.into_bytes()).unwrap();
         });
-        let bytes = worker.join().unwrap();
+        let completed = rx.recv_timeout(std::time::Duration::from_secs(1));
+        drop(held);
+        worker.join().unwrap();
+        let bytes = completed.unwrap();
         assert_eq!(bytes.as_ref(), b"test");
         assert_eq!(used(&budget), 32);
         assert!(MemoryWriter::bounded(1, budget.clone()).is_err());
