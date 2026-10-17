@@ -1,0 +1,20 @@
+--- a/tests/e2e/tests/concurrent_disconnect.rs
++++ b/tests/e2e/tests/concurrent_disconnect.rs
+@@ -124,6 +124,8 @@
+     for i in 0..N {
+         let expected_ab = format!("a->b #{i}");
+         bob.wait_for_event(10, |e| {
++            let observed: Vec<_> = e.messages().filter_map(|m| m.message.conversation.clone()).collect();
++            if !observed.is_empty() { eprintln!("RECEIPT_OBSERVER bob waiting={expected_ab:?} received={observed:?}"); }
+             e.messages()
+                 .any(|m| m.message.conversation.as_deref() == Some(expected_ab.as_str()))
+         })
+@@ -131,6 +133,8 @@
+         let expected_ba = format!("b->a #{i}");
+         alice
+             .wait_for_event(10, |e| {
++                let observed: Vec<_> = e.messages().filter_map(|m| m.message.conversation.clone()).collect();
++                if !observed.is_empty() { eprintln!("RECEIPT_OBSERVER alice waiting={expected_ba:?} received={observed:?}"); }
+                 e.messages()
+                     .any(|m| m.message.conversation.as_deref() == Some(expected_ba.as_str()))
+             })
