@@ -1,4 +1,4 @@
-name: Consumer NVS extraction measurements
+name: Consumer NVS storage buffer measurements
 on:
   push:
     branches: [agent/consumer-record-measurements]
@@ -14,7 +14,7 @@ env:
   MALLOC_TOP_PAD_: "131072"
 jobs:
   record:
-    name: Same-binary NVS extraction (${{ matrix.kind }})
+    name: Same-binary NVS buffer operations (${{ matrix.kind }})
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
@@ -50,9 +50,9 @@ jobs:
         run: |
           mkdir -p .ci-src
           curl --fail --silent --show-error --location \
-            https://raw.githubusercontent.com/oxidezap/whatsapp-rust-esp32/6ff5c05605c47ba68ace29b2644a719fe6397ecf/src/storage/record_buffer.rs \
+            https://raw.githubusercontent.com/oxidezap/whatsapp-rust-esp32/0265e4396e1c2acc8e601d968671f66efbe5e5ce/src/storage/record_buffer.rs \
             -o .ci-src/record_buffer.rs
-          printf '%s  %s\n' d4dd7a41414b77ba333b6a2a8cc3bbad63357b015626fede0745ce2b7e91eea4 .ci-src/record_buffer.rs | sha256sum --check
+          printf '%s  %s\n' 0d1a5c5c730dda98b4c301a85fa62b07c8c480ed7130e188ae0e2ac0d4018d9e .ci-src/record_buffer.rs | sha256sum --check
           sha256sum Cargo.lock .ci-src/record_buffer.rs
           rustc -Vv
           lscpu
