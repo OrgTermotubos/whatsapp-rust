@@ -448,6 +448,11 @@ harness = false
 required-features = ["bench-harness"]
 
 [[bench]]
+name = "bot_context_reply"
+harness = false
+required-features = ["bench-harness"]
+
+[[bench]]
 name = "appstate_prefetch"
 harness = false
 required-features = ["bench-harness"]

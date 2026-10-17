@@ -113,6 +113,23 @@ exact commands. Never infer a universal throughput gain from smaller futures.
 
 ## Pull request automation
 
+The `bot_context_reply` target compares the actual `MessageContext` quoted-reply
+helper with the frozen async wrappers from `4b8dfd20`. Both controls call the
+current client in the same binary, using separate, identically warmed DM
+fixtures with one or five peer devices. Construction verifies equal returned
+message content and warms both call sites outside measurement. The measured
+body boxes the helper future like a callback task, completes the encrypted send
+to the sink and drops its result. This isolates wrapper lifetime and frame
+costs; it is not a whole-revision comparison or a network/TLS/SQLite benchmark.
+CPU/memory controls run in the client shard, with native walltime in a separate
+job. Reaction controls additionally compare the cold routing/metadata frame
+boundaries against controls retaining the previous unboxed getters, for a DM and a
+cached ordinary eight-peer group. Both use the current send/encryption code;
+known cached flags need no extra query allocation. This isolates cold-frame cost,
+not a full reaction comparison to `4b8dfd20`, and does not qualify cold/CAG
+lookup performance. The existing short sample
+budget keeps ratchet/cache history bounded.
+
 The CodSpeed workflow runs the registered Divan CPU and memory comparisons on
 pull requests and main. The separate `Native runtime probes` workflow runs
 `cargo xt ci runtime-probes --out-dir runtime-probe-results` on the same events.
