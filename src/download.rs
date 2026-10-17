@@ -1249,9 +1249,12 @@ impl Client {
             downloadable,
             writer,
             Some(DownloadBudget::cancellable(DownloadLimits::default())),
-            MemoryWriter::into_bytes,
+            std::convert::identity,
         )
         .await
+        // Publish the shared owner on the caller, after the blocking download
+        // has completed. The writer still carries its allocation reservation.
+        .map(MemoryWriter::into_bytes)
     }
 
     async fn download_to_writer_with_budget<W, T, Finish>(
