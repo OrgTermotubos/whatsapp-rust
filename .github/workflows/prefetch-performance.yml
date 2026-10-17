@@ -22,6 +22,7 @@ env:
 
 jobs:
   prefetch:
+    if: github.event_name == 'workflow_dispatch'
     name: Prefetch (${{ matrix.mode }})
     runs-on: ubuntu-24.04
     timeout-minutes: 45
