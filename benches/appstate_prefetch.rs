@@ -12,13 +12,13 @@ fn main() {
 
 // These synchronous controls expose crypto/output costs without the runtime
 // internals that prevent useful callgraphs for the end-to-end cases.
-#[divan::bench(args = [65536, 1048576], sample_count = 30, sample_size = 1)]
+#[divan::bench(args = [65536, 1048576], sample_count = 1000, sample_size = 1)]
 fn streaming_vec(bencher: divan::Bencher, bytes: usize) {
     let fixture = StreamingDecryptHarness::new(bytes).expect("streaming fixture");
     bencher.bench_local(|| fixture.decrypt_vec().expect("verified streaming decrypt"));
 }
 
-#[divan::bench(args = [65536, 1048576], sample_count = 30, sample_size = 1)]
+#[divan::bench(args = [65536, 1048576], sample_count = 1000, sample_size = 1)]
 fn streaming_accounted(bencher: divan::Bencher, bytes: usize) {
     let fixture = StreamingDecryptHarness::new(bytes).expect("streaming fixture");
     bencher.bench_local(|| {
@@ -28,7 +28,7 @@ fn streaming_accounted(bencher: divan::Bencher, bytes: usize) {
     });
 }
 
-#[divan::bench(args = [65536, 1048576], sample_count = 10, sample_size = 1)]
+#[divan::bench(args = [65536, 1048576], sample_count = 1000, sample_size = 1)]
 fn four_external_blobs(bencher: divan::Bencher, bytes: usize) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -48,7 +48,7 @@ fn four_external_blobs(bencher: divan::Bencher, bytes: usize) {
         });
 }
 
-#[divan::bench(args = [65536, 1048576], sample_count = 10, sample_size = 1)]
+#[divan::bench(args = [65536, 1048576], sample_count = 1000, sample_size = 1)]
 fn eight_clients(bencher: divan::Bencher, bytes: usize) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
