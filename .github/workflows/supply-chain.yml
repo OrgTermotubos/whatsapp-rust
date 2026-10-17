@@ -114,5 +114,5 @@ jobs:
         run: target/debug/whatsapp-xtask ci compatibility-controls --lane "$LANE" --toolchain "$TOOLCHAIN"
       - name: Record exact source commit
         env:
-          EXPECTED_SHA: ${{ github.sha }}
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: target/debug/whatsapp-xtask ci workflow qualification-sha
