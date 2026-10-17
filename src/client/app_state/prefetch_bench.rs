@@ -44,6 +44,13 @@ impl PrefetchHarness {
             StreamingBodyHttp::new(encrypted.data_to_upload.into()),
         ))
         .await;
+        // Client construction schedules finite retention/cache initialization.
+        // Join it during setup instead of charging whichever prefetch polls it.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.bench_startup.wait(),
+        )
+        .await?;
         *client.media_conn.write().await = Some(crate::mediaconn::MediaConn {
             auth: "synthetic-probe".into(),
             ttl: 3600,
@@ -79,6 +86,10 @@ impl PrefetchHarness {
     }
 
     pub async fn prefetch(&self) -> Result<()> {
+        ensure!(
+            self.client.bench_startup.pending() == 0,
+            "startup entered prefetch measurement"
+        );
         let blobs = self.client.pre_download_external_blobs(&self.lists).await;
         ensure!(blobs.len() == 4, "prefetch lost a blob");
         for blob in blobs.values() {
