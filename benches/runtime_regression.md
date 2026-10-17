@@ -8,10 +8,12 @@ documented in `connected_idle.md`.
 
 `appstate_prefetch` registers the same prefetch fixture with Divan and the
 existing CodSpeed client shard, with one-client and eight-client rows. The latter
-uses four runtime workers and four blobs per client. It reports verified bytes per batch. Its native
-allocation profiler and CodSpeed instruments provide ongoing allocation/CPU
-coverage. Use the separate diagnostic executables for uninstrumented walltime
-and requested-heap comparisons.
+uses four runtime workers and four blobs per client. It reports verified bytes
+per batch. CodSpeed records simulation, memory and native walltime separately.
+The fixture joins finite startup tasks before measurement; synchronous Vec and
+accounted-writer controls distinguish streaming crypto/output from scheduling.
+Each walltime case has 1,000 rounds of one batch, without an explicit warmup.
+These rounds share a process and are not independent process-level replicates.
 Native Divan allocation columns exclude executor and blocking threads outside
 Divan's control. Use the global DHAT probe for concurrent heap measurements.
 CodSpeed uses its own instruments; compare matching instruments and environments.
@@ -120,6 +122,7 @@ artifact contains raw JSONL, stderr, revision, compiler, CPU and executable hash
 Any workload failure fails the job and preserves its diagnostic output.
 
 Native walltime on shared runners is observational. Compare matching main and
-PR artifacts with their host metadata; CodSpeed remains the deterministic CPU
-comparison. Neither workflow treats reduced allocation counts as proof of lower
+PR artifacts with their host metadata. CodSpeed simulation models CPU costs and
+omits syscall time; compare its CPU/cache environment warnings as well. Neither
+workflow treats reduced allocation counts as proof of lower
 latency or suppresses cryptographic and persistence failures.
