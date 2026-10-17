@@ -46,7 +46,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: prefetch-performance-${{ matrix.mode }}
-          cache-targets: "false"
+          cache-targets: "true"
       - name: Record source and host
         run: |
           git rev-parse HEAD
