@@ -680,6 +680,35 @@ enum CachedSessionCheckout {
     Present(SessionRecord, SessionCheckoutKey),
 }
 
+struct SessionFlushBatch {
+    records: Vec<(Arc<str>, bytes::Bytes)>,
+    versions: Vec<(Arc<str>, Weak<SessionRecord>)>,
+}
+
+impl SessionFlushBatch {
+    fn capture<'a>(
+        state: &SessionStoreState,
+        addresses: impl Iterator<Item = &'a Arc<str>>,
+        capacity: usize,
+    ) -> Self {
+        let mut records = Vec::with_capacity(capacity);
+        let mut versions = Vec::with_capacity(capacity);
+        for address in addresses {
+            if let Some(record) = state
+                .cache
+                .get(address.as_ref())
+                .and_then(SessionEntry::flushable_record)
+            {
+                let mut bytes = Vec::new();
+                record.serialize_into_for_store(&mut bytes, &state.incarnation);
+                records.push((address.clone(), bytes::Bytes::from(bytes)));
+                versions.push((address.clone(), Arc::downgrade(record)));
+            }
+        }
+        Self { records, versions }
+    }
+}
+
 struct SessionStoreState {
     incarnation: StoreIncarnation,
     checkout_generation: u64,
@@ -2023,22 +2052,46 @@ impl SignalStoreCache {
     }
 
     async fn flush_sessions(&self, backend: &dyn SignalStore) -> Result<()> {
+        let limit = backend.session_flush_batch_limit().max(1);
+        if limit == usize::MAX {
+            return self.flush_session_batch(backend, None).await;
+        }
+        // Freeze only the address set, not serialized records. Each chunk captures
+        // its versions and consumed-prekey snapshot under the same session lock.
+        // A finite set also prevents concurrent writes from extending this flush.
+        let addresses = {
+            let state = self.lock_sessions().await;
+            state.dirty.iter().cloned().collect::<Vec<_>>()
+        };
+        if addresses.is_empty() {
+            return self.flush_session_batch(backend, None).await;
+        }
+        for addresses in addresses.chunks(limit) {
+            self.flush_session_batch(backend, Some(addresses)).await?;
+        }
+        Ok(())
+    }
+
+    async fn flush_session_batch(
+        &self,
+        backend: &dyn SignalStore,
+        addresses: Option<&[Arc<str>]>,
+    ) -> Result<()> {
         let (batch, versions, deleted, mut prekeys) = {
             let state = self.lock_sessions().await;
-            let mut batch = Vec::with_capacity(state.dirty.len());
-            let mut versions = Vec::with_capacity(state.dirty.len());
-            for address in &state.dirty {
-                if let Some(record) = state
-                    .cache
-                    .get(address.as_ref())
-                    .and_then(SessionEntry::flushable_record)
-                {
-                    let mut bytes = Vec::new();
-                    record.serialize_into_for_store(&mut bytes, &state.incarnation);
-                    batch.push((address.clone(), bytes::Bytes::from(bytes)));
-                    versions.push((address.clone(), Arc::downgrade(record)));
+            let SessionFlushBatch {
+                records: batch,
+                versions,
+            } = match addresses {
+                Some(addresses) => SessionFlushBatch::capture(
+                    &state,
+                    addresses.iter().filter(|address| state.dirty.contains(*address)),
+                    addresses.len(),
+                ),
+                None => {
+                    SessionFlushBatch::capture(&state, state.dirty.iter(), state.dirty.len())
                 }
-            }
+            };
             // Capture consumption together with its session snapshot: a prekey
             // buffered during the I/O must wait for the next snapshot, even if
             // this flush persisted an older session at the same address.
@@ -4277,6 +4330,42 @@ mod consumed_prekey_atomicity_tests {
             backend.load_prekey(PREKEY_ID).await.unwrap().is_none(),
             "prekey of an already-durable session must be deleted on the next flush"
         );
+    }
+
+    #[tokio::test]
+    async fn partial_session_flush_keeps_other_consumed_prekeys_durable() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+        let first = seed(&backend).await;
+        let second = ProtocolAddress::new("alice", 1.into());
+        backend
+            .store_prekey(PREKEY_ID + 1, b"second-durable-prekey", false)
+            .await
+            .unwrap();
+        for (address, id) in [(&first, PREKEY_ID), (&second, PREKEY_ID + 1)] {
+            cache.put_session(address, SessionRecord::new_fresh()).await;
+            cache.remove_prekey(id, address.as_str()).await;
+        }
+
+        let _flush_guard = cache.flush_lock.lock().await;
+        let first_keys = [Arc::<str>::from(first.as_str())];
+        cache
+            .flush_session_batch(&backend, Some(&first_keys))
+            .await
+            .unwrap();
+        assert!(backend.get_session(first.as_str()).await.unwrap().is_some());
+        assert!(backend.get_session(second.as_str()).await.unwrap().is_none());
+        assert!(backend.load_prekey(PREKEY_ID).await.unwrap().is_none());
+        assert!(backend.load_prekey(PREKEY_ID + 1).await.unwrap().is_some());
+
+        let second_keys = [Arc::<str>::from(second.as_str())];
+        cache
+            .flush_session_batch(&backend, Some(&second_keys))
+            .await
+            .unwrap();
+        assert!(backend.get_session(second.as_str()).await.unwrap().is_some());
+        assert!(backend.load_prekey(PREKEY_ID + 1).await.unwrap().is_none());
+        assert!(cache.removed_prekeys.lock().await.is_empty());
     }
 
     /// A failed session write must abort the flush before the prekey deletion, and

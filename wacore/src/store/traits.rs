@@ -627,6 +627,16 @@ pub trait SignalStore: Send + Sync {
     /// Store an encrypted session.
     async fn put_session(&self, address: &str, session: &[u8]) -> Result<()>;
 
+    /// Maximum number of sessions serialized together by the cache flush.
+    ///
+    /// Memory-constrained stores can request smaller chunks so completed
+    /// serialized records are released before the next chunk is encoded.
+    /// The default preserves full batching; zero is treated as one.
+    /// This does not limit an individual session's encoded size.
+    fn session_flush_batch_limit(&self) -> usize {
+        usize::MAX
+    }
+
     /// Store multiple encrypted sessions in a single batch operation.
     /// Default implementation falls back to individual `put_session` calls.
     async fn put_sessions_batch(&self, sessions: &[(Arc<str>, Bytes)]) -> Result<()> {

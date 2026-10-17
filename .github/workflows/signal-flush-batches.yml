@@ -1,0 +1,10 @@
+name: Signal flush batch experiment
+on:
+  push:
+    branches: [agent/signal-flush-batches]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  correctness:
+    uses: ./.github/workflows/main.yml
