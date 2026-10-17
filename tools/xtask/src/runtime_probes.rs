@@ -27,14 +27,23 @@ fn measured_command(executable: &str, stats: &Path) -> Command {
     command
 }
 
-pub fn run(root: &Path, out_dir: &Path) -> Result<()> {
+fn prepare_output_dir(out_dir: &Path) -> Result<std::path::PathBuf> {
+    // Children run at the workspace root, while the caller may be in a member.
+    // Resolve before creating files so both processes use the same directory.
+    let out_dir = std::path::absolute(out_dir)?;
     if out_dir.exists() {
         ensure!(
-            std::fs::read_dir(out_dir)?.next().is_none(),
+            std::fs::read_dir(&out_dir)?.next().is_none(),
             "probe output directory must be empty"
         );
     }
-    std::fs::create_dir_all(out_dir)?;
+    std::fs::create_dir_all(&out_dir)?;
+    Ok(out_dir)
+}
+
+pub fn run(root: &Path, out_dir: &Path) -> Result<()> {
+    let out_dir = prepare_output_dir(out_dir)?;
+    let out_dir = out_dir.as_path();
     eprintln!("building native runtime probe executables");
     let build = capture_build(
         Command::new("cargo").current_dir(root).args([
@@ -200,6 +209,62 @@ fn capture_build(command: &mut Command, out_dir: &Path) -> Result<Output> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn relative_output_from_member_survives_child_working_directory_change() {
+        let root = tempfile::tempdir().unwrap();
+        let member = root.path().join("member");
+        std::fs::create_dir(&member).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .current_dir(&member)
+            .env("XTASK_RELATIVE_OUTPUT_ROOT", root.path())
+            .args([
+                "--ignored",
+                "--exact",
+                "runtime_probes::tests::relative_output_child",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stats: ProcessStats =
+            serde_json::from_slice(&std::fs::read(member.join("results/process.json")).unwrap())
+                .unwrap();
+        assert_eq!(stats.exit_code, 23);
+        assert!(!root.path().join("results").exists());
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture"]
+    #[cfg(target_os = "linux")]
+    fn relative_output_child() {
+        let Some(root) = std::env::var_os("XTASK_RELATIVE_OUTPUT_ROOT") else {
+            return;
+        };
+        let output_dir = prepare_output_dir(Path::new("results")).unwrap();
+        assert!(output_dir.is_absolute());
+        let output = measured_command(
+            std::env::current_exe().unwrap().to_str().unwrap(),
+            &output_dir.join("process.json"),
+        )
+        .current_dir(root)
+        .env("XTASK_COMPILER_FAILURE_FIXTURE", "1")
+        .args([
+            "--ignored",
+            "--exact",
+            "runtime_probes::tests::compiler_error_child",
+            "--nocapture",
+        ])
+        .output()
+        .unwrap();
+        assert_eq!(output.status.code(), Some(23));
+        assert!(prepare_output_dir(Path::new("results")).is_err());
+    }
 
     #[test]
     #[cfg(target_os = "linux")]
