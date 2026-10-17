@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 use whatsapp_rust::{serde, serde_json};
 
+#[allow(unused_imports)] // The imported production module contains host-only tests.
 #[path = "../consumer/src/supervisor/message_log.rs"]
 mod message_log;
 use message_log::MessageLogEntry;
