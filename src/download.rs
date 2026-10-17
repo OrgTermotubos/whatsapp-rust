@@ -1250,8 +1250,11 @@ impl Client {
     pub(crate) async fn download_prepared_memory(
         &self,
         downloadable: &dyn Downloadable,
-        writer: MemoryWriter,
+        mut writer: MemoryWriter,
     ) -> std::result::Result<bytes::Bytes, ClientDownloadError> {
+        writer
+            .preallocate_large()
+            .map_err(ClientDownloadError::from)?;
         self.download_to_writer_with_budget(
             downloadable,
             writer,
@@ -5266,14 +5269,30 @@ mod tests {
                 self.live.store(false, Ordering::SeqCst);
             }
         }
+        struct ReadPause {
+            started: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+            resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
         struct Body {
             bytes: Cursor<Vec<u8>>,
             live: Arc<AtomicBool>,
             dropped: Arc<AtomicBool>,
+            pause: Option<Arc<ReadPause>>,
         }
         impl Read for Body {
             fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
                 assert!(self.live.load(Ordering::SeqCst));
+                if let Some(pause) = &self.pause
+                    && let Some(started) = pause.started.lock().unwrap().take()
+                {
+                    started.send(()).unwrap();
+                    pause
+                        .resume
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                }
                 self.bytes.read(out)
             }
         }
@@ -5284,6 +5303,7 @@ mod tests {
             }
         }
         struct Http {
+            pause: Option<Arc<ReadPause>>,
             gate: Arc<Mutex<()>>,
             encrypted: Vec<u8>,
             live: Arc<AtomicBool>,
@@ -5325,11 +5345,30 @@ mod tests {
                         bytes: Cursor::new(self.encrypted.clone()),
                         live: self.live.clone(),
                         dropped: self.body_dropped.clone(),
+                        pause: self.pause.clone(),
                     }),
                 ))
             }
         }
-        for cancel in [false, true] {
+        #[derive(Clone, Copy)]
+        enum Completion {
+            Success,
+            CancelQueued,
+            CancelActive,
+        }
+        for completion in [
+            Completion::Success,
+            Completion::CancelQueued,
+            Completion::CancelActive,
+        ] {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let pause = matches!(completion, Completion::CancelActive).then(|| {
+                Arc::new(ReadPause {
+                    started: std::sync::Mutex::new(Some(started_tx)),
+                    resume: std::sync::Mutex::new(resume_rx),
+                })
+            });
             let plaintext = b"admitted streaming body";
             let (params, encrypted) = encrypted_params(plaintext);
             let gate = Arc::new(Mutex::new(()));
@@ -5339,6 +5378,7 @@ mod tests {
             let opened = Arc::new(AtomicBool::new(false));
             let body_dropped = Arc::new(AtomicBool::new(false));
             let http = Arc::new(Http {
+                pause,
                 gate: gate.clone(),
                 encrypted,
                 live: live.clone(),
@@ -5362,11 +5402,32 @@ mod tests {
                 "admission must not occupy the worker"
             );
             assert!(!opened.load(Ordering::SeqCst));
-            if cancel {
+            if matches!(completion, Completion::CancelQueued) {
                 drop(future);
                 drop(held);
                 assert!(gate.try_lock_arc().is_some());
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
+            } else if matches!(completion, Completion::CancelActive) {
+                drop(held);
+                assert!(futures::poll!(future.as_mut()).is_pending());
+                started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                drop(future);
+                assert!(live.load(Ordering::SeqCst));
+                assert!(
+                    gate.try_lock_arc().is_none(),
+                    "cancelled caller must not release active I/O's lease"
+                );
+                resume_tx.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while gate.try_lock_arc().is_none() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(body_dropped.load(Ordering::SeqCst));
+                assert!(!live.load(Ordering::SeqCst));
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
             } else {
                 drop(held);
                 let writer = tokio::time::timeout(Duration::from_secs(5), future)

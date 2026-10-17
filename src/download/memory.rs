@@ -80,8 +80,9 @@ fn policy_io(error: DownloadPolicyError) -> io::Error {
     io::Error::other(MemoryPolicyCause(error))
 }
 
-/// Creates no payload allocation until the first write. Reservations follow
-/// the allocation into the prefetch map, including while other jobs run.
+/// Starts without a payload allocation. Small budgets stay lazy; large admitted
+/// buffers may preallocate on the caller. Reservations follow the allocation
+/// into the prefetch map, including while other jobs run.
 pub(crate) struct MemoryWriter {
     cursor: Cursor<Vec<u8>>,
     initial_capacity: usize,
@@ -139,7 +140,19 @@ impl MemoryWriter {
         (self.cursor.into_inner(), self.reservation)
     }
 
-    fn reserve(&mut self, required: usize) -> io::Result<()> {
+    // Large admitted blobs can allocate on the async caller, where the
+    // retained bytes will also be published/dropped. Small embedded budgets
+    // remain lazy so network/foreground admission can release transient RAM.
+    pub(crate) fn preallocate_large(&mut self) -> Result<(), DownloadPolicyError> {
+        if let Some(reservation) = &self.reservation
+            && reservation.bytes >= 64 * 1024
+        {
+            self.reserve(reservation.bytes)?;
+        }
+        Ok(())
+    }
+
+    fn reserve(&mut self, required: usize) -> Result<(), DownloadPolicyError> {
         let current = self.cursor.get_ref().capacity();
         if required <= current {
             return Ok(());
@@ -154,16 +167,16 @@ impl MemoryWriter {
                 .max(self.initial_capacity)
         };
         let target = if let Some(reservation) = &mut self.reservation {
-            reservation.resize(required, preferred).map_err(policy_io)?
+            reservation.resize(required, preferred)?
         } else {
             preferred
         };
         let buffer = self.cursor.get_mut();
         if buffer.try_reserve_exact(target - buffer.len()).is_err() {
             if let Some(reservation) = &mut self.reservation {
-                reservation.resize(current, current).map_err(policy_io)?;
+                reservation.resize(current, current)?;
             }
-            return Err(policy_io(DownloadPolicyError::AllocationFailed));
+            return Err(DownloadPolicyError::AllocationFailed);
         }
         if let Some(reservation) = &mut self.reservation {
             let actual = buffer.capacity().max(reservation.bytes);
@@ -171,8 +184,8 @@ impl MemoryWriter {
                 // An allocator may supply excess capacity. Never publish an
                 // allocation that cannot be charged to the shared budget.
                 *buffer = Vec::new();
-                reservation.resize(0, 0).map_err(policy_io)?;
-                return Err(policy_io(error));
+                reservation.resize(0, 0)?;
+                return Err(error);
             }
         }
         Ok(())
@@ -200,7 +213,7 @@ impl Write for MemoryWriter {
         let required = position
             .checked_add(bytes.len())
             .ok_or_else(|| policy_io(DownloadPolicyError::AllocationFailed))?;
-        self.reserve(required)?;
+        self.reserve(required).map_err(policy_io)?;
         self.cursor.write(bytes)
     }
 
@@ -236,6 +249,43 @@ mod tests {
 
     fn used(budget: &MemoryBudget) -> usize {
         *budget.0.used.lock().unwrap()
+    }
+
+    #[test]
+    fn eager_large_buffers_stay_empty_and_keep_clone_lifetime_accounting() {
+        for declared in [8192, 65536] {
+            let budget = MemoryBudget::new(declared);
+            let mut writer = MemoryWriter::bounded(declared as u64, budget.clone()).unwrap();
+            writer.preallocate_large().unwrap();
+            assert!(writer.cursor.get_ref().is_empty());
+            assert_eq!(
+                writer.cursor.get_ref().capacity(),
+                if declared == 8192 { 0 } else { declared }
+            );
+            writer.write_all(b"verified payload").unwrap();
+            let bytes = writer.into_bytes();
+            assert_eq!(bytes.as_ref(), b"verified payload");
+            let clone = bytes.clone();
+            drop(bytes);
+            assert_eq!(used(&budget), declared);
+            assert!(MemoryWriter::bounded(1, budget.clone()).is_err());
+            drop(clone);
+            assert_eq!(used(&budget), 0);
+        }
+    }
+
+    #[test]
+    fn eager_allocation_overflow_is_fallible_and_releases_the_reservation() {
+        let budget = MemoryBudget::new(usize::MAX);
+        let mut writer = MemoryWriter::bounded(usize::MAX as u64, budget.clone()).unwrap();
+        assert_eq!(
+            writer.preallocate_large(),
+            Err(DownloadPolicyError::AllocationFailed)
+        );
+        assert_eq!(writer.cursor.get_ref().capacity(), 0);
+        assert_eq!(used(&budget), 0);
+        drop(writer);
+        assert_eq!(used(&budget), 0);
     }
 
     #[test]
