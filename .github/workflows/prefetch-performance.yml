@@ -55,56 +55,52 @@ jobs:
       # CodSpeed groups uploads from this workflow run. Distinct benchmark
       # names keep each pinned production implementation separate in that run.
       - uses: actions/checkout@v7
-        if: matrix.mode == 'walltime'
         with:
           ref: f56a47f43d1ff5a5af1f1766a99c8ca987535129
           path: .prefetch-unbounded
           persist-credentials: false
       - name: Build the unbounded reference
-        if: matrix.mode == 'walltime'
         working-directory: .prefetch-unbounded
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          BUILD_MODES: ${{ matrix.build }}
         run: |
           git rev-parse HEAD
           sed -i -E 's/^fn (four_external_blobs|eight_clients)\(/fn unbounded_\1(/' benches/appstate_prefetch.rs
           git diff -- benches/appstate_prefetch.rs
           sha256sum Cargo.lock src/client/app_state/prefetch_bench.rs
-          cargo codspeed build -m walltime -p whatsapp-rust --features bench-harness --bench appstate_prefetch
+          cargo codspeed build $BUILD_MODES -p whatsapp-rust --features bench-harness --bench appstate_prefetch
       - name: Measure the unbounded reference
-        if: matrix.mode == 'walltime'
         uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         with:
-          mode: walltime
+          mode: ${{ matrix.mode }}
           runner-version: "5.4.2"
           working-directory: .prefetch-unbounded
           run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
       - uses: actions/checkout@v7
-        if: matrix.mode == 'walltime'
         with:
           ref: a2f6bd940cb88bcc4e70f056aad34c5172ec8db8
           path: .prefetch-baseline
           persist-credentials: false
-      - name: Build the pinned walltime reference
-        if: matrix.mode == 'walltime'
+      - name: Build the pinned mutex reference
         working-directory: .prefetch-baseline
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          BUILD_MODES: ${{ matrix.build }}
         run: |
           git rev-parse HEAD
           sed -i -E 's/^fn (four_external_blobs|eight_clients|streaming_vec|streaming_accounted)\(/fn reference_\1(/' benches/appstate_prefetch.rs
           git diff -- benches/appstate_prefetch.rs
           sha256sum Cargo.lock src/client/app_state/prefetch_bench.rs
-          cargo codspeed build -m walltime -p whatsapp-rust --features bench-harness --bench appstate_prefetch
-      - name: Measure the pinned walltime reference
-        if: matrix.mode == 'walltime'
+          cargo codspeed build $BUILD_MODES -p whatsapp-rust --features bench-harness --bench appstate_prefetch
+      - name: Measure the pinned mutex reference
         uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         with:
-          mode: walltime
+          mode: ${{ matrix.mode }}
           runner-version: "5.4.2"
           working-directory: .prefetch-baseline
           run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
