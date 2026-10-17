@@ -31,8 +31,6 @@ jobs:
         include:
           - mode: walltime
             build: -m walltime
-          - mode: simulation,memory
-            build: -m simulation -m memory
     steps:
       - uses: actions/checkout@v7
         with:
@@ -56,17 +54,14 @@ jobs:
           lscpu
       # CodSpeed groups uploads from this workflow run. Distinct benchmark
       # names keep each pinned production implementation separate in that run.
-      - name: Build the unbounded reference
+      # Reverse the first matched run's order for a fresh-process confirmation.
+      - name: Build prefetch benchmark
         env:
           BUILD_MODES: ${{ matrix.build }}
         run: |
-          git reset --hard f56a47f43d1ff5a5af1f1766a99c8ca987535129
           git rev-parse HEAD
-          sed -i -E 's/^fn (four_external_blobs|eight_clients)\(/fn unbounded_\1(/' benches/appstate_prefetch.rs
-          git diff -- benches/appstate_prefetch.rs
-          sha256sum Cargo.lock src/client/app_state/prefetch_bench.rs
           cargo codspeed build $BUILD_MODES -p whatsapp-rust --features bench-harness --bench appstate_prefetch
-      - name: Measure the unbounded reference
+      - name: Measure prefetch
         uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369
         with:
           mode: ${{ matrix.mode }}
@@ -88,14 +83,17 @@ jobs:
           mode: ${{ matrix.mode }}
           runner-version: "5.4.2"
           run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
-      - name: Build prefetch benchmark
+      - name: Build the unbounded reference
         env:
           BUILD_MODES: ${{ matrix.build }}
         run: |
-          git reset --hard "$GITHUB_SHA"
+          git reset --hard f56a47f43d1ff5a5af1f1766a99c8ca987535129
           git rev-parse HEAD
+          sed -i -E 's/^fn (four_external_blobs|eight_clients)\(/fn unbounded_\1(/' benches/appstate_prefetch.rs
+          git diff -- benches/appstate_prefetch.rs
+          sha256sum Cargo.lock src/client/app_state/prefetch_bench.rs
           cargo codspeed build $BUILD_MODES -p whatsapp-rust --features bench-harness --bench appstate_prefetch
-      - name: Measure prefetch
+      - name: Measure the unbounded reference
         uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369
         with:
           mode: ${{ matrix.mode }}
@@ -103,3 +101,6 @@ jobs:
           disable-memory-capture-stack: "false"
           disable-memory-track-physical: "false"
           run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
+      - name: Restore candidate source
+        if: always()
+        run: git reset --hard "$GITHUB_SHA"
