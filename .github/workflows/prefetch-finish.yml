@@ -1,4 +1,4 @@
-name: Prefetch finish paired process repeats
+name: Bounded prefetch versus pinned unbounded reference
 on:
   push:
     branches: [agent/prefetch-finish-lifetime]
@@ -17,7 +17,7 @@ env:
   MALLOC_TOP_PAD_: "131072"
 jobs:
   native:
-    name: Three paired native process repetitions
+    name: Three paired current versus unbounded native repetitions
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -42,11 +42,13 @@ jobs:
           lscpu
       - name: Build pair 1 reference independently
         run: |
-          git reset --hard f47c529ce84eaf62a6636f28d339c3fcb175f4e1
+          git reset --hard f56a47f43d1ff5a5af1f1766a99c8ca987535129
           git rev-parse HEAD
           sed -i -E 's/^fn (four_external_blobs|eight_clients|streaming_vec|streaming_accounted)\(/fn pair1_reference_\1(/' benches/appstate_prefetch.rs
           sha256sum Cargo.lock src/client/app_state/prefetch_bench.rs
           cargo codspeed build -m walltime -p whatsapp-rust --features bench-harness --bench appstate_prefetch
+          # Attribute this experiment to its workflow head, not the source PR check.
+          git reset --hard "$GITHUB_SHA"
       - name: Measure pair 1 reference fresh process
         uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369
         with:
@@ -55,11 +57,13 @@ jobs:
           run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
       - name: Build pair 1 candidate independently
         run: |
-          git reset --hard bf1bc047d7e473ea7ad566549b4010c156c43bf6
+          git reset --hard 3244be404c3b0596e3fc438e3590875422d1893b
           git rev-parse HEAD
           sed -i -E 's/^fn (four_external_blobs|eight_clients|streaming_vec|streaming_accounted)\(/fn pair1_candidate_\1(/' benches/appstate_prefetch.rs
           sha256sum Cargo.lock src/client/app_state/prefetch_bench.rs
           cargo codspeed build -m walltime -p whatsapp-rust --features bench-harness --bench appstate_prefetch
+          # Attribute this experiment to its workflow head, not the source PR check.
+          git reset --hard "$GITHUB_SHA"
       - name: Measure pair 1 candidate fresh process
         uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369
         with:
@@ -68,11 +72,13 @@ jobs:
           run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
       - name: Build pair 2 candidate independently
         run: |
-          git reset --hard bf1bc047d7e473ea7ad566549b4010c156c43bf6
+          git reset --hard 3244be404c3b0596e3fc438e3590875422d1893b
           git rev-parse HEAD
           sed -i -E 's/^fn (four_external_blobs|eight_clients|streaming_vec|streaming_accounted)\(/fn pair2_candidate_\1(/' benches/appstate_prefetch.rs
           sha256sum Cargo.lock src/client/app_state/prefetch_bench.rs
           cargo codspeed build -m walltime -p whatsapp-rust --features bench-harness --bench appstate_prefetch
+          # Attribute this experiment to its workflow head, not the source PR check.
+          git reset --hard "$GITHUB_SHA"
       - name: Measure pair 2 candidate fresh process
         uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369
         with:
@@ -81,11 +87,13 @@ jobs:
           run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
       - name: Build pair 2 reference independently
         run: |
-          git reset --hard f47c529ce84eaf62a6636f28d339c3fcb175f4e1
+          git reset --hard f56a47f43d1ff5a5af1f1766a99c8ca987535129
           git rev-parse HEAD
           sed -i -E 's/^fn (four_external_blobs|eight_clients|streaming_vec|streaming_accounted)\(/fn pair2_reference_\1(/' benches/appstate_prefetch.rs
           sha256sum Cargo.lock src/client/app_state/prefetch_bench.rs
           cargo codspeed build -m walltime -p whatsapp-rust --features bench-harness --bench appstate_prefetch
+          # Attribute this experiment to its workflow head, not the source PR check.
+          git reset --hard "$GITHUB_SHA"
       - name: Measure pair 2 reference fresh process
         uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369
         with:
@@ -94,11 +102,13 @@ jobs:
           run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
       - name: Build pair 3 reference independently
         run: |
-          git reset --hard f47c529ce84eaf62a6636f28d339c3fcb175f4e1
+          git reset --hard f56a47f43d1ff5a5af1f1766a99c8ca987535129
           git rev-parse HEAD
           sed -i -E 's/^fn (four_external_blobs|eight_clients|streaming_vec|streaming_accounted)\(/fn pair3_reference_\1(/' benches/appstate_prefetch.rs
           sha256sum Cargo.lock src/client/app_state/prefetch_bench.rs
           cargo codspeed build -m walltime -p whatsapp-rust --features bench-harness --bench appstate_prefetch
+          # Attribute this experiment to its workflow head, not the source PR check.
+          git reset --hard "$GITHUB_SHA"
       - name: Measure pair 3 reference fresh process
         uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369
         with:
@@ -107,11 +117,13 @@ jobs:
           run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
       - name: Build pair 3 candidate independently
         run: |
-          git reset --hard bf1bc047d7e473ea7ad566549b4010c156c43bf6
+          git reset --hard 3244be404c3b0596e3fc438e3590875422d1893b
           git rev-parse HEAD
           sed -i -E 's/^fn (four_external_blobs|eight_clients|streaming_vec|streaming_accounted)\(/fn pair3_candidate_\1(/' benches/appstate_prefetch.rs
           sha256sum Cargo.lock src/client/app_state/prefetch_bench.rs
           cargo codspeed build -m walltime -p whatsapp-rust --features bench-harness --bench appstate_prefetch
+          # Attribute this experiment to its workflow head, not the source PR check.
+          git reset --hard "$GITHUB_SHA"
       - name: Measure pair 3 candidate fresh process
         uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369
         with:
