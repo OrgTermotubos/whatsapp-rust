@@ -2666,7 +2666,7 @@ impl Client {
         message: wa::Message,
         edit: EditAttribute,
         borrowed_stanza_id: Option<String>,
-    ) -> impl std::future::Future<Output = Result<SendResult, SendError>> + '_ {
+    ) -> impl Future<Output = Result<SendResult, SendError>> + '_ {
         // Own the protobuf outside the coroutine. Edit/revoke callers otherwise
         // retain its inline tree in every enclosing send future.
         let message = std::sync::Arc::new(message);
