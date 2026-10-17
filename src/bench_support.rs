@@ -28,7 +28,7 @@
 pub mod connected_idle;
 pub use crate::client::PrefetchHarness;
 mod media;
-pub use media::StreamingBodyHttp;
+pub use media::{StreamingBodyHttp, StreamingDecryptHarness};
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;

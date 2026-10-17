@@ -97,7 +97,7 @@ impl MemoryWriter {
         }
     }
 
-    pub(super) fn bounded(
+    pub(crate) fn bounded(
         declared: u64,
         budget: MemoryBudget,
     ) -> Result<Self, DownloadPolicyError> {
