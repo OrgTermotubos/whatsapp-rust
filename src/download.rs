@@ -1089,7 +1089,7 @@ impl Client {
         let capacity = limits.plaintext_capacity(download_capacity(downloadable) as u64) as usize;
         download_media_with_retry(
             client_refresh_budget(downloadable),
-            |force| Box::pin(self.prepare_requests(downloadable, force)),
+            |force| self.prepare_requests(downloadable, force),
             || async { self.invalidate_media_conn().await },
             |request| async move {
                 execute_request_into_memory(
@@ -1156,17 +1156,24 @@ impl Client {
             .map_err(|error| DownloadRequestError::Prepare(error.into()))?;
         // A static URL is fetched verbatim, so the media-conn IQ would be a round
         // trip whose answer is discarded before a byte of it is read.
-        let route =
-            if downloadable.static_url().is_some() {
-                MediaRoute::new(Vec::new())
-            } else {
-                MediaRoute::from(&self.refresh_media_conn(force_refresh).await.map_err(
-                    |source| DownloadRequestError::Session {
-                        force_refresh,
-                        source,
-                    },
-                )?)
-            };
+        let session_error = |source| DownloadRequestError::Session {
+            force_refresh,
+            source,
+        };
+        let route = if downloadable.static_url().is_some() {
+            MediaRoute::new(Vec::new())
+        } else if !force_refresh
+            && let Some(route) = self.cached_download_route().await.map_err(session_error)?
+        {
+            route
+        } else {
+            // Only a miss/forced retry allocates the larger refresh future.
+            MediaRoute::from(
+                &Box::pin(self.refresh_media_conn(force_refresh))
+                    .await
+                    .map_err(session_error)?,
+            )
+        };
         DownloadUtils::prepare_download_requests(downloadable, &route)
             .map_err(DownloadRequestError::Prepare)
     }
@@ -1276,7 +1283,7 @@ impl Client {
             client_refresh_budget(downloadable),
             &self.runtime,
             writer,
-            |force| Box::pin(self.prepare_requests(downloadable, force)),
+            |force| self.prepare_requests(downloadable, force),
             || async { self.invalidate_media_conn().await },
             |request, writer| async move {
                 streaming_download_and_decrypt_mapped(

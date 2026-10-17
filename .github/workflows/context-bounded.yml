@@ -1,7 +1,7 @@
-name: Qualify asynchronous streaming admission
+name: Qualify warm download route ownership
 on:
   push:
-    branches: [agent/http-admission-c3]
+    branches: [agent/prefetch-warm-route]
   workflow_dispatch:
 permissions:
   contents: read
