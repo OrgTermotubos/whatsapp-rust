@@ -637,6 +637,13 @@ pub trait SignalStore: Send + Sync {
         usize::MAX
     }
 
+    /// Reuse a uniquely owned serialization buffer for single-session flushes.
+    /// The default retains no buffer. Opting in retains at most 8 KiB between
+    /// flushes; backends retaining shared bytes keep their ownership unchanged.
+    fn reuse_session_flush_buffer(&self) -> bool {
+        false
+    }
+
     /// Store multiple encrypted sessions in a single batch operation.
     /// Default implementation falls back to individual `put_session` calls.
     async fn put_sessions_batch(&self, sessions: &[(Arc<str>, Bytes)]) -> Result<()> {

@@ -41,6 +41,10 @@ macro_rules! forward_domains {
                 self.backend.session_flush_batch_limit()
             }
 
+            fn reuse_session_flush_buffer(&self) -> bool {
+                self.backend.reuse_session_flush_buffer()
+            }
+
             forward_methods! {
                 fn put_identity<'s, 'a>(this: &'s Self, address: &'a str, key: [u8; 32]) -> Result<()>;
                 fn put_identities_batch<'s, 'a>(this: &'s Self, identities: &'a [(Arc<str>, [u8; 32])]) -> Result<()>;

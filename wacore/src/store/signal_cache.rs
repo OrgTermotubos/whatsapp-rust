@@ -601,7 +601,7 @@ impl<V> UserIndexedCache<V> {
 /// back to `max_entries` (amortized O(1) thanks to the slack early-out).
 pub struct SignalStoreCache {
     /// Orders persistence and teardown. Cache get/put methods do not acquire it.
-    flush_lock: Mutex<()>,
+    flush_lock: Mutex<SessionFlushBuffer>,
     sessions: Mutex<SessionStoreState>,
     /// The gates' own flags (see `PendingWireGate`), so a send answers
     /// `needs_pre_wire_flush` without queueing behind cache mutations or snapshot
@@ -680,9 +680,105 @@ enum CachedSessionCheckout {
     Present(SessionRecord, SessionCheckoutKey),
 }
 
+// Keep the default cache footprint to one pointer; allocate the Vec header
+// only after an opted-in backend releases a reusable buffer.
+#[allow(clippy::box_collection)]
+type SessionFlushBuffer = Option<Box<Vec<u8>>>;
+
+fn reclaim_session_buffer(pool: &mut SessionFlushBuffer, batch: Vec<(Arc<str>, bytes::Bytes)>) {
+    for (_, bytes) in batch {
+        if let Ok(bytes) = bytes.try_into_mut() {
+            let mut bytes = Vec::from(bytes);
+            let capacity = bytes.capacity();
+            if capacity != 0
+                && capacity <= 8192
+                && pool
+                    .as_ref()
+                    .is_none_or(|saved| saved.capacity() < capacity)
+            {
+                bytes.clear();
+                if let Some(saved) = pool.as_mut() {
+                    **saved = bytes;
+                } else {
+                    *pool = Some(Box::new(bytes));
+                }
+            }
+        }
+    }
+}
+
 struct SessionFlushBatch {
     records: Vec<(Arc<str>, bytes::Bytes)>,
     versions: Vec<(Arc<str>, Weak<SessionRecord>)>,
+}
+
+#[cfg(test)]
+mod session_flush_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn unique_buffer_is_reused_without_reallocation() {
+        let mut data = Vec::with_capacity(4096);
+        data.extend_from_slice(b"persisted session");
+        let pointer = data.as_ptr();
+        let mut pool = None;
+        reclaim_session_buffer(&mut pool, vec![(Arc::from("address"), data.into())]);
+        let saved = pool.as_ref().unwrap();
+        assert!(saved.is_empty());
+        assert_eq!(saved.capacity(), 4096);
+        assert_eq!(saved.as_ptr(), pointer);
+    }
+
+    #[test]
+    fn retained_backend_bytes_are_not_modified_or_stolen() {
+        let bytes = bytes::Bytes::from(vec![7; 2048]);
+        let backend = bytes.clone();
+        let mut pool = None;
+        reclaim_session_buffer(&mut pool, vec![(Arc::from("address"), bytes)]);
+        assert!(pool.is_none());
+        assert_eq!(backend.as_ref(), vec![7; 2048]);
+    }
+
+    #[test]
+    fn oversized_buffers_are_not_retained() {
+        let mut pool = None;
+        reclaim_session_buffer(
+            &mut pool,
+            vec![(Arc::from("address"), vec![0; 8193].into())],
+        );
+        assert!(pool.is_none());
+    }
+
+    #[tokio::test]
+    async fn explicit_clear_releases_retained_buffer() {
+        let cache = SignalStoreCache::new();
+        *cache.flush_lock.lock().await = Some(Box::new(Vec::with_capacity(4096)));
+        cache.clear().await;
+        assert!(cache.flush_lock.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn capture_reuses_buffer_and_preserves_persisted_encoding() {
+        let cache = SignalStoreCache::new();
+        let address = crate::libsignal::protocol::ProtocolAddress::new("pool-test", 1.into());
+        cache
+            .put_session(&address, SessionRecord::new_fresh())
+            .await;
+        let state = cache.lock_sessions().await;
+        let key = Arc::<str>::from(address.as_str());
+        let mut pool = Some(Box::new(Vec::with_capacity(4096)));
+        let pointer = pool.as_ref().unwrap().as_ptr();
+        let batch = SessionFlushBatch::capture(&state, std::iter::once(&key), 1, &mut pool);
+        assert_eq!(batch.records[0].1.as_ptr(), pointer);
+        let expected = batch.records[0].1.to_vec();
+        assert!(
+            SignalStoreCache::decode_stored_session(&key, &expected, &state.incarnation).is_some()
+        );
+        reclaim_session_buffer(&mut pool, batch.records);
+        let next = SessionFlushBatch::capture(&state, std::iter::once(&key), 1, &mut pool);
+        assert_eq!(next.records[0].1.as_ptr(), pointer);
+        assert_eq!(next.records[0].1.as_ref(), expected);
+    }
 }
 
 impl SessionFlushBatch {
@@ -690,6 +786,7 @@ impl SessionFlushBatch {
         state: &SessionStoreState,
         addresses: impl Iterator<Item = &'a Arc<str>>,
         capacity: usize,
+        pool: &mut SessionFlushBuffer,
     ) -> Self {
         let mut records = Vec::with_capacity(capacity);
         let mut versions = Vec::with_capacity(capacity);
@@ -699,7 +796,9 @@ impl SessionFlushBatch {
                 .get(address.as_ref())
                 .and_then(SessionEntry::flushable_record)
             {
-                let mut bytes = Vec::new();
+                let mut bytes = pool
+                    .as_mut()
+                    .map_or_else(Vec::new, |saved| std::mem::take(&mut **saved));
                 record.serialize_into_for_store(&mut bytes, &state.incarnation);
                 records.push((address.clone(), bytes::Bytes::from(bytes)));
                 versions.push((address.clone(), Arc::downgrade(record)));
@@ -1073,7 +1172,7 @@ impl SignalStoreCache {
         let sessions = SessionStoreState::new(incarnation);
         let sender_keys = SenderKeyStoreState::new(incarnation);
         Self {
-            flush_lock: Mutex::new(()),
+            flush_lock: Mutex::new(None),
             session_wire_gate: sessions.reservation_pending.flag(),
             sender_key_wire_gate: sender_keys.wire_gate_pending.flag(),
             sessions: Mutex::new(sessions),
@@ -2045,16 +2144,27 @@ impl SignalStoreCache {
     /// additionally excludes session mutations through its destructive I/O.
     /// A concurrent mutation stays dirty unless that exact record was persisted.
     pub async fn flush(&self, backend: &dyn SignalStore) -> Result<()> {
-        let _flush_guard = self.flush_lock.lock().await;
-        self.flush_sessions(backend).await?;
+        let mut flush_guard = self.flush_lock.lock().await;
+        self.flush_sessions(backend, &mut flush_guard).await?;
         self.flush_identities(backend).await?;
         self.flush_sender_keys(backend).await
     }
 
-    async fn flush_sessions(&self, backend: &dyn SignalStore) -> Result<()> {
+    async fn flush_sessions(
+        &self,
+        backend: &dyn SignalStore,
+        saved: &mut SessionFlushBuffer,
+    ) -> Result<()> {
         let limit = backend.session_flush_batch_limit().max(1);
+        let mut unused = None;
+        let pool = if limit == 1 && backend.reuse_session_flush_buffer() {
+            saved
+        } else {
+            *saved = None;
+            &mut unused
+        };
         if limit == usize::MAX {
-            return self.flush_session_batch(backend, None).await;
+            return self.flush_session_batch(backend, None, pool).await;
         }
         // Freeze only the address set, not serialized records. Each chunk captures
         // its versions and consumed-prekey snapshot under the same session lock.
@@ -2064,10 +2174,11 @@ impl SignalStoreCache {
             state.dirty.iter().cloned().collect::<Vec<_>>()
         };
         if addresses.is_empty() {
-            return self.flush_session_batch(backend, Some(&[])).await;
+            return self.flush_session_batch(backend, Some(&[]), pool).await;
         }
         for addresses in addresses.chunks(limit) {
-            self.flush_session_batch(backend, Some(addresses)).await?;
+            self.flush_session_batch(backend, Some(addresses), pool)
+                .await?;
         }
         Ok(())
     }
@@ -2076,6 +2187,7 @@ impl SignalStoreCache {
         &self,
         backend: &dyn SignalStore,
         addresses: Option<&[Arc<str>]>,
+        pool: &mut SessionFlushBuffer,
     ) -> Result<()> {
         let (batch, versions, deleted, mut prekeys) = {
             let state = self.lock_sessions().await;
@@ -2089,8 +2201,11 @@ impl SignalStoreCache {
                         .iter()
                         .filter(|address| state.dirty.contains(*address)),
                     addresses.len(),
+                    pool,
                 ),
-                None => SessionFlushBatch::capture(&state, state.dirty.iter(), state.dirty.len()),
+                None => {
+                    SessionFlushBatch::capture(&state, state.dirty.iter(), state.dirty.len(), pool)
+                }
             };
             // Capture consumption together with its session snapshot: a prekey
             // buffered during the I/O must wait for the next snapshot, even if
@@ -2109,7 +2224,13 @@ impl SignalStoreCache {
         };
 
         if !batch.is_empty() {
-            backend.put_sessions_batch(&batch).await?;
+            let result = backend.put_sessions_batch(&batch).await;
+            if backend.session_flush_batch_limit().max(1) == 1
+                && backend.reuse_session_flush_buffer()
+            {
+                reclaim_session_buffer(pool, batch);
+            }
+            result?;
             let mut state = self.lock_sessions().await;
             for (address, version) in &versions {
                 if state
@@ -2390,7 +2511,18 @@ impl SignalStoreCache {
                 + s.reservation_pending.table_bytes();
             (s.cache.len() as u64, keys_len, recs)
         };
-        let session_bytes: usize = session_keys_len
+        // Never wait for the flush gate while inspecting cache state.
+        let buffer_bytes = self
+            .flush_lock
+            .try_lock()
+            .and_then(|guard| {
+                guard
+                    .as_ref()
+                    .map(|buffer| size_of::<Vec<u8>>() + buffer.capacity())
+            })
+            .unwrap_or(0);
+        let session_bytes: usize = buffer_bytes
+            + session_keys_len
             + session_recs
                 .iter()
                 .map(|r| r.estimated_size())
@@ -2466,7 +2598,8 @@ impl SignalStoreCache {
         let _identity_change = self.identity_continuity.changing([]);
         self.session_recovery_generation
             .fetch_add(1, Ordering::AcqRel);
-        let _flush_guard = self.flush_lock.lock().await;
+        let mut flush_guard = self.flush_lock.lock().await;
+        *flush_guard = None;
         {
             let mut sessions = self.sessions.lock().await;
             let mut pending = self.pending_session_restores();
@@ -2489,7 +2622,8 @@ impl SignalStoreCache {
     /// Only a discard can make a post-flush write's stale snapshot reloadable.
     #[doc(hidden)]
     pub async fn clear_after_flush(&self) {
-        let _flush_guard = self.flush_lock.lock().await;
+        let mut flush_guard = self.flush_lock.lock().await;
+        *flush_guard = None;
         let mut sessions = self.lock_sessions().await;
         if sessions.dirty.is_empty()
             && sessions.deleted.is_empty()
@@ -4349,7 +4483,7 @@ mod consumed_prekey_atomicity_tests {
 
         let _flush_guard = cache.flush_lock.lock().await;
         cache
-            .flush_session_batch(&backend, Some(&[]))
+            .flush_session_batch(&backend, Some(&[]), &mut None)
             .await
             .unwrap();
         assert!(backend.get_session(first.as_str()).await.unwrap().is_none());
@@ -4357,7 +4491,7 @@ mod consumed_prekey_atomicity_tests {
         assert!(backend.load_prekey(PREKEY_ID + 1).await.unwrap().is_some());
         let first_keys = [Arc::<str>::from(first.as_str())];
         cache
-            .flush_session_batch(&backend, Some(&first_keys))
+            .flush_session_batch(&backend, Some(&first_keys), &mut None)
             .await
             .unwrap();
         assert!(backend.get_session(first.as_str()).await.unwrap().is_some());
@@ -4375,14 +4509,14 @@ mod consumed_prekey_atomicity_tests {
         backend.set_fail_session_writes(true);
         assert!(
             cache
-                .flush_session_batch(&backend, Some(&second_keys))
+                .flush_session_batch(&backend, Some(&second_keys), &mut None)
                 .await
                 .is_err()
         );
         assert!(backend.load_prekey(PREKEY_ID + 1).await.unwrap().is_some());
         backend.set_fail_session_writes(false);
         cache
-            .flush_session_batch(&backend, Some(&second_keys))
+            .flush_session_batch(&backend, Some(&second_keys), &mut None)
             .await
             .unwrap();
         assert!(
