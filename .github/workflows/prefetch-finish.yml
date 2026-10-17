@@ -42,9 +42,11 @@ jobs:
           prefix-key: prefetch-finish-guards
           cache-targets: "false"
       - name: Preserve prefetch first-poll allocation and admission behavior
-        run: cargo test -p whatsapp-rust --lib client::app_state::
+        run: |
+          cargo test -p whatsapp-rust --lib client::app_state::
       - name: Preserve download hashes, cancellation, retries and lease lifetime
-        run: cargo test -p whatsapp-rust --lib download::
+        run: |
+          cargo test -p whatsapp-rust --lib download::
 
   prefetch:
     needs: guards
