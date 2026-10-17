@@ -1,66 +1,25 @@
-name: Prefetch finish lifetime experiment
-
+name: Prefetch finish native confirmation
 on:
   push:
     branches: [agent/prefetch-finish-lifetime]
   workflow_dispatch:
-
 permissions:
   contents: read
   id-token: write
-
 concurrency:
   group: prefetch-finish-${{ github.ref }}
   cancel-in-progress: true
-
 env:
   CARGO_TERM_COLOR: never
   MALLOC_ARENA_MAX: "1"
   MALLOC_MMAP_THRESHOLD_: "131072"
   MALLOC_TRIM_THRESHOLD_: "131072"
   MALLOC_TOP_PAD_: "131072"
-
 jobs:
-  guards:
-    name: Preserve download policy and allocation guards
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    env:
-      CARGO_INCREMENTAL: "0"
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-06-16
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: protoc@3.25.3
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: prefetch-finish-guards
-          cache-targets: "false"
-      - name: Preserve prefetch first-poll allocation and admission behavior
-        run: |
-          cargo test -p whatsapp-rust --lib client::app_state::
-      - name: Preserve download hashes, cancellation, retries and lease lifetime
-        run: |
-          cargo test -p whatsapp-rust --lib download::
-
-  prefetch:
-    needs: guards
-    name: Prefetch (${{ matrix.mode }})
+  native:
+    name: Reverse-order native confirmation and unbounded reference
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - mode: walltime
-            build: -m walltime
-          - mode: simulation,memory
-            build: -m simulation -m memory
     steps:
       - uses: actions/checkout@v7
         with:
@@ -74,45 +33,55 @@ jobs:
           tool: protoc@3.25.3,cargo-codspeed@5.0.2
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: prefetch-performance-${{ matrix.mode }}
+          prefix-key: prefetch-performance-walltime
           cache-targets: "true"
           cache-workspace-crates: "true"
-      - name: Record source and host
+      - name: Record shared host and compiler
         run: |
-          git rev-parse HEAD
           rustc -Vv
           lscpu
-      # CodSpeed groups uploads from this workflow run. Distinct benchmark
-      # names keep each pinned production implementation separate in that run.
-      # Compare caller-side buffer ownership conversion with the unchanged worker-side reference.
-      - name: Build prefetch benchmark
-        env:
-          BUILD_MODES: ${{ matrix.build }}
-        run: |
-          git rev-parse HEAD
-          cargo codspeed build $BUILD_MODES -p whatsapp-rust --features bench-harness --bench appstate_prefetch
-      - name: Measure prefetch
-        uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369
-        with:
-          mode: ${{ matrix.mode }}
-          runner-version: "5.4.2"
-          run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
-      - name: Build the pinned worker-finish reference
-        env:
-          BUILD_MODES: ${{ matrix.build }}
+      # Candidate source is unchanged from the completed policy/hash/cancellation
+      # guards in run 39012894503. Reverse the first trial's implementation order.
+      - name: Build pinned worker-finish reference first
         run: |
           git reset --hard f47c529ce84eaf62a6636f28d339c3fcb175f4e1
           git rev-parse HEAD
           sed -i -E 's/^fn (four_external_blobs|eight_clients|streaming_vec|streaming_accounted)\(/fn reference_\1(/' benches/appstate_prefetch.rs
-          git diff -- benches/appstate_prefetch.rs
           sha256sum Cargo.lock src/client/app_state/prefetch_bench.rs
-          cargo codspeed build $BUILD_MODES -p whatsapp-rust --features bench-harness --bench appstate_prefetch
-      - name: Measure the pinned worker-finish reference
+          cargo codspeed build -m walltime -p whatsapp-rust --features bench-harness --bench appstate_prefetch
+      - name: Measure pinned worker-finish reference
         uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369
         with:
-          mode: ${{ matrix.mode }}
+          mode: walltime
           runner-version: "5.4.2"
           run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
-      - name: Restore candidate source
+      - name: Build pinned caller-finish candidate second
+        run: |
+          git reset --hard bf1bc047d7e473ea7ad566549b4010c156c43bf6
+          git rev-parse HEAD
+          sha256sum Cargo.lock src/client/app_state/prefetch_bench.rs
+          cargo codspeed build -m walltime -p whatsapp-rust --features bench-harness --bench appstate_prefetch
+      - name: Measure pinned caller-finish candidate
+        uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369
+        with:
+          mode: walltime
+          runner-version: "5.4.2"
+          run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
+      # This source backports the identical verified fixture and 1,000-sample
+      # budget onto the pre-budget implementation, with the same Cargo.lock.
+      - name: Build pinned unbounded reference
+        run: |
+          git reset --hard f56a47f43d1ff5a5af1f1766a99c8ca987535129
+          git rev-parse HEAD
+          sed -i -E 's/^fn (four_external_blobs|eight_clients)\(/fn unbounded_\1(/' benches/appstate_prefetch.rs
+          sha256sum Cargo.lock src/client/app_state/prefetch_bench.rs
+          cargo codspeed build -m walltime -p whatsapp-rust --features bench-harness --bench appstate_prefetch
+      - name: Measure pinned unbounded reference
+        uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369
+        with:
+          mode: walltime
+          runner-version: "5.4.2"
+          run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
+      - name: Restore workflow head
         if: always()
         run: git reset --hard "$GITHUB_SHA"
