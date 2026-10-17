@@ -82,16 +82,7 @@ async fn app_state_async_frames_fit_small_heap_blocks() {
         (
             "blob_job",
             size_of_val(
-                &client.external_blob_job(
-                    &reference,
-                    BlobKind::Snapshot(WAPatchName::Regular),
-                    client
-                        .prepare_memory_download(
-                            &reference,
-                            crate::download::memory::MemoryBudget::new(0),
-                        )
-                        .unwrap(),
-                ),
+                &client.external_blob_job(&reference, BlobKind::Snapshot(WAPatchName::Regular)),
             ),
         ),
         (
