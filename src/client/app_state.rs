@@ -36,6 +36,35 @@ enum BlobKind {
 type PrefetchedBlobs =
     HashMap<String, std::result::Result<bytes::Bytes, Arc<crate::download::ClientDownloadError>>>;
 
+fn retain_prefetched_blob(
+    pre_downloaded: &mut PrefetchedBlobs,
+    path: Option<String>,
+    kind: BlobKind,
+    result: std::result::Result<bytes::Bytes, crate::download::ClientDownloadError>,
+) {
+    match &result {
+        Ok(bytes) => match kind {
+            BlobKind::Mutation(version) => {
+                debug!(target: "Client/AppState", "Downloaded external mutations for patch v{} ({} bytes)", version, bytes.len())
+            }
+            BlobKind::Snapshot(_) => {
+                debug!(target: "Client/AppState", "Downloaded external snapshot ({} bytes)", bytes.len())
+            }
+        },
+        Err(error) => match kind {
+            BlobKind::Snapshot(name) => {
+                warn!("Failed to download external snapshot for {name:?}: {error}")
+            }
+            BlobKind::Mutation(version) => {
+                warn!("Failed to download external mutations for patch v{version}: {error}")
+            }
+        },
+    }
+    if let Some(path) = path {
+        pre_downloaded.insert(path, result.map_err(Arc::new));
+    }
+}
+
 #[derive(Debug)]
 struct BlobDownloadFailure(Arc<crate::download::ClientDownloadError>);
 
@@ -985,46 +1014,32 @@ impl Client {
 
         let policy = &self.cache_config.app_state_downloads;
         let mut pre_downloaded = HashMap::with_capacity(jobs.len());
-        // A small batch that fits admission has no refill work. Join its thin
-        // jobs directly instead of allocating a wake-queue node per download.
-        // Keep larger batches on the ready queue so polling stays scalable.
-        let mut completed = if jobs.len() <= 4 && jobs.len() <= policy.config.concurrency().get() {
-            futures::stream::iter(
-                futures::future::join_all(
-                    jobs.into_iter()
-                        .map(|(ext, kind)| self.external_blob_job(ext, kind)),
-                )
-                .await,
-            )
-            .left_stream()
-        } else {
-            futures::stream::iter(jobs)
-                .map(|(ext, kind)| self.external_blob_job(ext, kind))
-                .buffer_unordered(policy.config.concurrency().get())
-                .right_stream()
-        };
-        while let Some((path, kind, result)) = completed.next().await {
-            match &result {
-                Ok(bytes) => match kind {
-                    BlobKind::Mutation(version) => {
-                        debug!(target: "Client/AppState", "Downloaded external mutations for patch v{} ({} bytes)", version, bytes.len())
-                    }
-                    BlobKind::Snapshot(_) => {
-                        debug!(target: "Client/AppState", "Downloaded external snapshot ({} bytes)", bytes.len())
-                    }
-                },
-                Err(error) => match kind {
-                    BlobKind::Snapshot(name) => {
-                        warn!("Failed to download external snapshot for {name:?}: {error}")
-                    }
-                    BlobKind::Mutation(version) => {
-                        warn!("Failed to download external mutations for patch v{version}: {error}")
-                    }
-                },
+        // No refill is needed when a small batch fits admission. Joining thin
+        // jobs avoids a wake-queue node per download without a large frame.
+        // Larger batches keep the ready queue's scalable polling behavior.
+        if jobs.len() <= 4 && jobs.len() <= policy.config.concurrency().get() {
+            let mut pending = Vec::with_capacity(jobs.len());
+            for (ext, kind) in jobs {
+                pending.push(self.external_blob_job(ext, kind));
             }
-            if let Some(path) = path {
-                pre_downloaded.insert(path, result.map_err(Arc::new));
+            for (path, kind, result) in futures::future::join_all(pending).await {
+                retain_prefetched_blob(&mut pre_downloaded, path, kind, result);
             }
+            return pre_downloaded;
+        }
+        let mut jobs = jobs.into_iter();
+        let mut in_flight = futures::stream::FuturesUnordered::new();
+        loop {
+            while in_flight.len() < policy.config.concurrency().get() {
+                let Some((ext, kind)) = jobs.next() else {
+                    break;
+                };
+                in_flight.push(self.external_blob_job(ext, kind));
+            }
+            let Some((path, kind, result)) = in_flight.next().await else {
+                break;
+            };
+            retain_prefetched_blob(&mut pre_downloaded, path, kind, result);
         }
 
         pre_downloaded
