@@ -59,7 +59,9 @@ impl Client {
     ) -> Result<SendResult, SendError> {
         let chat = &chat.into();
         let request = if chat.is_group() && self.is_community_announce_group(chat).await? {
-            self.prepare_enc_reaction(chat, target_key, emoji).await?
+            // Secret lookup and encrypted-envelope construction are CAG-only.
+            // Keep their frame out of ordinary DM/group reaction futures.
+            Box::pin(self.prepare_enc_reaction(chat, target_key, emoji)).await?
         } else {
             plain_reaction_request(chat, target_key, emoji)
         };

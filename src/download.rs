@@ -1089,7 +1089,7 @@ impl Client {
         let capacity = limits.plaintext_capacity(download_capacity(downloadable) as u64) as usize;
         download_media_with_retry(
             client_refresh_budget(downloadable),
-            |force| Box::pin(self.prepare_requests(downloadable, force)),
+            |force| self.prepare_requests(downloadable, force),
             || async { self.invalidate_media_conn().await },
             |request| async move {
                 execute_request_into_memory(
@@ -1156,17 +1156,24 @@ impl Client {
             .map_err(|error| DownloadRequestError::Prepare(error.into()))?;
         // A static URL is fetched verbatim, so the media-conn IQ would be a round
         // trip whose answer is discarded before a byte of it is read.
-        let route =
-            if downloadable.static_url().is_some() {
-                MediaRoute::new(Vec::new())
-            } else {
-                MediaRoute::from(&self.refresh_media_conn(force_refresh).await.map_err(
-                    |source| DownloadRequestError::Session {
-                        force_refresh,
-                        source,
-                    },
-                )?)
-            };
+        let session_error = |source| DownloadRequestError::Session {
+            force_refresh,
+            source,
+        };
+        let route = if downloadable.static_url().is_some() {
+            MediaRoute::new(Vec::new())
+        } else if !force_refresh
+            && let Some(route) = self.cached_download_route().await.map_err(session_error)?
+        {
+            route
+        } else {
+            // Only a miss/forced retry allocates the larger refresh future.
+            MediaRoute::from(
+                &Box::pin(self.refresh_media_conn(force_refresh))
+                    .await
+                    .map_err(session_error)?,
+            )
+        };
         DownloadUtils::prepare_download_requests(downloadable, &route)
             .map_err(DownloadRequestError::Prepare)
     }
@@ -1243,8 +1250,11 @@ impl Client {
     pub(crate) async fn download_prepared_memory(
         &self,
         downloadable: &dyn Downloadable,
-        writer: MemoryWriter,
+        mut writer: MemoryWriter,
     ) -> std::result::Result<bytes::Bytes, ClientDownloadError> {
+        writer
+            .preallocate_large()
+            .map_err(ClientDownloadError::from)?;
         self.download_to_writer_with_budget(
             downloadable,
             writer,
@@ -1276,7 +1286,7 @@ impl Client {
             client_refresh_budget(downloadable),
             &self.runtime,
             writer,
-            |force| Box::pin(self.prepare_requests(downloadable, force)),
+            |force| self.prepare_requests(downloadable, force),
             || async { self.invalidate_media_conn().await },
             |request, writer| async move {
                 streaming_download_and_decrypt_mapped(
@@ -1428,11 +1438,34 @@ where
         .await;
     }
 
+    let admission = match http_client.streaming_admission() {
+        Some(admission) => {
+            if let Some(budget) = &hashes.budget
+                && let Err(error) = budget.check_cancelled()
+            {
+                return Ok(WriterAttempt::Failed(
+                    writer,
+                    DownloadRequestError::ResourcePolicy(error),
+                ));
+            }
+            match admission.await {
+                Ok(permit) => Some(permit),
+                Err(error) => {
+                    return Ok(WriterAttempt::Failed(
+                        writer,
+                        DownloadRequestError::other(error),
+                    ));
+                }
+            }
+        }
+        None => None,
+    };
     let http_client = http_client.clone();
     let url = request.url.clone();
     let decryption = request.decryption.clone();
 
     Ok(wacore::runtime::blocking(&**runtime, move || {
+        let _admission = admission;
         let mut writer = writer;
 
         let result = (|| -> std::result::Result<(), DownloadRequestError> {
@@ -5189,6 +5222,222 @@ mod tests {
                     5,
                     "four downloads and one upload, no CDN retry"
                 );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn streaming_admission_waits_before_blocking_and_lives_through_body_drop() {
+        use std::io::Read;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::Duration;
+        use wacore::net::{StreamingHttpResponse, StreamingRequestPermit};
+        use wacore::runtime::{AbortHandle, BoxFuture};
+
+        struct CountRuntime {
+            inner: crate::TokioRuntime,
+            calls: Arc<AtomicUsize>,
+        }
+        impl Runtime for CountRuntime {
+            fn spawn(&self, future: BoxFuture<'static, ()>) -> AbortHandle {
+                self.inner.spawn(future)
+            }
+            fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()> {
+                self.inner.sleep(duration)
+            }
+            fn spawn_blocking(
+                &self,
+                work: Box<dyn FnOnce() + Send + 'static>,
+            ) -> BoxFuture<'static, ()> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.spawn_blocking(work)
+            }
+            fn yield_now(&self) -> Option<BoxFuture<'static, ()>> {
+                self.inner.yield_now()
+            }
+        }
+        struct Permit {
+            _guard: async_lock::MutexGuardArc<()>,
+            live: Arc<AtomicBool>,
+            opened: Arc<AtomicBool>,
+            body_dropped: Arc<AtomicBool>,
+        }
+        impl Drop for Permit {
+            fn drop(&mut self) {
+                if self.opened.load(Ordering::SeqCst) {
+                    assert!(self.body_dropped.load(Ordering::SeqCst));
+                }
+                self.live.store(false, Ordering::SeqCst);
+            }
+        }
+        struct ReadPause {
+            started: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+            resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        struct Body {
+            bytes: Cursor<Vec<u8>>,
+            live: Arc<AtomicBool>,
+            dropped: Arc<AtomicBool>,
+            pause: Option<Arc<ReadPause>>,
+        }
+        impl Read for Body {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                assert!(self.live.load(Ordering::SeqCst));
+                if let Some(pause) = &self.pause
+                    && let Some(started) = pause.started.lock().unwrap().take()
+                {
+                    started.send(()).unwrap();
+                    pause
+                        .resume
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                }
+                self.bytes.read(out)
+            }
+        }
+        impl Drop for Body {
+            fn drop(&mut self) {
+                assert!(self.live.load(Ordering::SeqCst));
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+        struct Http {
+            pause: Option<Arc<ReadPause>>,
+            gate: Arc<Mutex<()>>,
+            encrypted: Vec<u8>,
+            live: Arc<AtomicBool>,
+            opened: Arc<AtomicBool>,
+            body_dropped: Arc<AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl HttpClient for Http {
+            async fn execute(
+                &self,
+                _: crate::http::HttpRequest,
+            ) -> Result<crate::http::HttpResponse> {
+                unreachable!("must stream")
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn streaming_admission(&self) -> Option<BoxFuture<'_, Result<StreamingRequestPermit>>> {
+                Some(Box::pin(async move {
+                    let guard = self.gate.lock_arc().await;
+                    self.live.store(true, Ordering::SeqCst);
+                    Ok(Box::new(Permit {
+                        _guard: guard,
+                        live: self.live.clone(),
+                        opened: self.opened.clone(),
+                        body_dropped: self.body_dropped.clone(),
+                    }) as StreamingRequestPermit)
+                }))
+            }
+            fn execute_streaming(
+                &self,
+                _: crate::http::HttpRequest,
+            ) -> Result<StreamingHttpResponse> {
+                assert!(self.live.load(Ordering::SeqCst));
+                self.opened.store(true, Ordering::SeqCst);
+                Ok(StreamingHttpResponse::new(
+                    200,
+                    Box::new(Body {
+                        bytes: Cursor::new(self.encrypted.clone()),
+                        live: self.live.clone(),
+                        dropped: self.body_dropped.clone(),
+                        pause: self.pause.clone(),
+                    }),
+                ))
+            }
+        }
+        #[derive(Clone, Copy)]
+        enum Completion {
+            Success,
+            CancelQueued,
+            CancelActive,
+        }
+        for completion in [
+            Completion::Success,
+            Completion::CancelQueued,
+            Completion::CancelActive,
+        ] {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let pause = matches!(completion, Completion::CancelActive).then(|| {
+                Arc::new(ReadPause {
+                    started: std::sync::Mutex::new(Some(started_tx)),
+                    resume: std::sync::Mutex::new(resume_rx),
+                })
+            });
+            let plaintext = b"admitted streaming body";
+            let (params, encrypted) = encrypted_params(plaintext);
+            let gate = Arc::new(Mutex::new(()));
+            let held = gate.lock_arc().await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let live = Arc::new(AtomicBool::new(false));
+            let opened = Arc::new(AtomicBool::new(false));
+            let body_dropped = Arc::new(AtomicBool::new(false));
+            let http = Arc::new(Http {
+                pause,
+                gate: gate.clone(),
+                encrypted,
+                live: live.clone(),
+                opened: opened.clone(),
+                body_dropped: body_dropped.clone(),
+            });
+            let runtime: Arc<dyn Runtime> = Arc::new(CountRuntime {
+                inner: crate::TokioRuntime,
+                calls: calls.clone(),
+            });
+            let downloader = MediaDownloader::with_default_hosts(http, runtime);
+            let mut future = Box::pin(downloader.download_to_writer(
+                &params,
+                Cursor::new(Vec::new()),
+                DownloadLimits::new(4096, 4096),
+            ));
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "admission must not occupy the worker"
+            );
+            assert!(!opened.load(Ordering::SeqCst));
+            if matches!(completion, Completion::CancelQueued) {
+                drop(future);
+                drop(held);
+                assert!(gate.try_lock_arc().is_some());
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+            } else if matches!(completion, Completion::CancelActive) {
+                drop(held);
+                assert!(futures::poll!(future.as_mut()).is_pending());
+                started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                drop(future);
+                assert!(live.load(Ordering::SeqCst));
+                assert!(
+                    gate.try_lock_arc().is_none(),
+                    "cancelled caller must not release active I/O's lease"
+                );
+                resume_tx.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while gate.try_lock_arc().is_none() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(body_dropped.load(Ordering::SeqCst));
+                assert!(!live.load(Ordering::SeqCst));
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            } else {
+                drop(held);
+                let writer = tokio::time::timeout(Duration::from_secs(5), future)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(writer.into_inner(), plaintext);
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert!(body_dropped.load(Ordering::SeqCst));
+                assert!(!live.load(Ordering::SeqCst));
             }
         }
     }
