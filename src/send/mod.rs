@@ -660,9 +660,7 @@ fn classify_interactive(im: &wa::message::InteractiveMessage) -> Option<BizCateg
 ///
 /// Returns `None` when the message has no interactive payload, or one that
 /// announces nothing (a storefront, or a payload with neither buttons nor any
-/// renderable envelope). Otherwise returns the assembled `<biz>` node. The
-/// caller is responsible for prepending `<bot biz_bot="1"/>` for DM-bound
-/// sends (see `build_extra_stanza_nodes`).
+/// renderable envelope). Otherwise returns the assembled `<biz>` node.
 ///
 /// `now_unix_secs` is the current wall-clock time in unix seconds. Taking it
 /// as a parameter keeps the function pure and lets tests pin the resulting
@@ -720,11 +718,14 @@ fn extract_interactive_message(msg: &wa::Message) -> Option<&wa::message::Intera
 
 /// Assemble the `extra_stanza_nodes` vector for a non-newsletter send.
 ///
-/// Order: `inferred_meta`, optional `<bot biz_bot="1"/>` (DM only), `<biz>`,
-/// then any user-provided extra nodes. Pure so the caller stays trivial and
-/// the assembly logic is unit-testable.
+/// Order: `inferred_meta`, `<biz>`, then any user-provided extra nodes. Pure
+/// so the caller stays trivial and the assembly logic is unit-testable.
+///
+/// Termotubos fork: upstream also prepends `<bot biz_bot="1"/>` on DM sends,
+/// which makes WhatsApp label every interactive message with the "AI" badge.
+/// This fork never emits it.
 fn build_extra_stanza_nodes(
-    to: &Jid,
+    _to: &Jid,
     inferred_meta: Option<Node>,
     biz: Option<Node>,
     user_nodes: Vec<Node>,
@@ -732,16 +733,10 @@ fn build_extra_stanza_nodes(
     if inferred_meta.is_none() && biz.is_none() {
         return user_nodes;
     }
-    let bot_emitted = biz.is_some() && !to.is_group();
-    let extra = inferred_meta.is_some() as usize + biz.is_some() as usize + bot_emitted as usize;
+    let extra = inferred_meta.is_some() as usize + biz.is_some() as usize;
     let mut nodes = Vec::with_capacity(user_nodes.len() + extra);
     nodes.extend(inferred_meta);
-    if let Some(node) = biz {
-        if bot_emitted {
-            nodes.push(NodeBuilder::new("bot").attr("biz_bot", "1").build());
-        }
-        nodes.push(node);
-    }
+    nodes.extend(biz);
     nodes.extend(user_nodes);
     nodes
 }
@@ -4467,27 +4462,17 @@ mod tests {
             Jid::from_str(s).expect("valid jid in test")
         }
 
-        /// DM: `<bot biz_bot="1"/>` is prepended before the `<biz>`. The
-        /// order matters because it is part of the wire shape.
+        /// DM: this fork never emits `<bot biz_bot="1"/>`; only `<biz>`.
         #[test]
-        fn dm_emits_bot_before_biz() {
+        fn dm_omits_bot() {
             let nodes = build_extra_stanza_nodes(
                 &jid("5511999999999@s.whatsapp.net"),
                 None,
                 Some(quick_reply_biz()),
                 vec![],
             );
-            assert_eq!(nodes.len(), 2, "expected [<bot>, <biz>]");
-            assert_eq!(nodes[0].tag, "bot");
-            assert_eq!(
-                nodes[0]
-                    .attrs()
-                    .optional_string("biz_bot")
-                    .unwrap()
-                    .as_ref(),
-                "1"
-            );
-            assert_eq!(nodes[1].tag, "biz");
+            assert_eq!(nodes.len(), 1, "expected [<biz>]");
+            assert_eq!(nodes[0].tag, "biz");
         }
 
         /// Group: `<bot>` is NOT emitted; only `<biz>`.
@@ -4503,17 +4488,17 @@ mod tests {
             assert_eq!(nodes[0].tag, "biz");
         }
 
-        /// LID DM (non-group): `<bot>` is still emitted.
+        /// LID DM (non-group): `<bot>` is not emitted either.
         #[test]
-        fn lid_dm_emits_bot() {
+        fn lid_dm_omits_bot() {
             let nodes = build_extra_stanza_nodes(
                 &jid("100000000000001@lid"),
                 None,
                 Some(payment_biz()),
                 vec![],
             );
-            assert_eq!(nodes.len(), 2);
-            assert_eq!(nodes[0].tag, "bot");
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].tag, "biz");
         }
 
         /// No biz + no meta → user nodes pass through untouched.
@@ -4526,9 +4511,9 @@ mod tests {
             assert_eq!(nodes[0].tag, "custom");
         }
 
-        /// Full ordering: [meta, bot, biz, user_nodes...].
+        /// Full ordering: [meta, biz, user_nodes...].
         #[test]
-        fn full_ordering_meta_bot_biz_user() {
+        fn full_ordering_meta_biz_user() {
             let meta = NodeBuilder::new("meta").attr("appdata", "default").build();
             let user_a = NodeBuilder::new("user_a").build();
             let user_b = NodeBuilder::new("user_b").build();
@@ -4538,12 +4523,11 @@ mod tests {
                 Some(quick_reply_biz()),
                 vec![user_a, user_b],
             );
-            assert_eq!(nodes.len(), 5);
+            assert_eq!(nodes.len(), 4);
             assert_eq!(nodes[0].tag, "meta");
-            assert_eq!(nodes[1].tag, "bot");
-            assert_eq!(nodes[2].tag, "biz");
-            assert_eq!(nodes[3].tag, "user_a");
-            assert_eq!(nodes[4].tag, "user_b");
+            assert_eq!(nodes[1].tag, "biz");
+            assert_eq!(nodes[2].tag, "user_a");
+            assert_eq!(nodes[3].tag, "user_b");
         }
 
         /// Meta-only (no biz) preserves order: meta then user nodes; no bot.
